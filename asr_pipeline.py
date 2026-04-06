@@ -1,19 +1,19 @@
 """
 Real-time ASR Pipeline using Whisper
-백엔드로부터 WebSocket으로 오디오를 받아 실시간 텍스트화
 
 Architecture:
-  Backend --[WebSocket]--> AudioReceiver --> VAD --> WhisperTranscriber --> Backend
+  Audio source --> VAD --> SpeechBuffer --> WhisperTranscriber --> str (text)
+
+전사된 텍스트는 on_transcription 콜백으로 전달됩니다.
+이후 처리(LLM 전달, 저장, WebSocket 송신 등)는 호출자가 담당합니다.
 """
 
 import asyncio
 import json
-import queue
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import websockets
@@ -190,164 +190,138 @@ class SpeechBuffer:
 
 
 # ---------------------------------------------------------------------------
-# 메인 파이프라인
+# 공통 ASR 코어 (오디오 → 텍스트 변환만 담당)
+# ---------------------------------------------------------------------------
+
+class ASRCore:
+    """
+    VAD + SpeechBuffer + WhisperTranscriber를 묶은 핵심 ASR 유닛.
+
+    오디오 청크를 push()하면 발화가 완성될 때마다 on_transcription 콜백으로
+    전사된 텍스트(str)를 전달합니다. 이후 처리는 호출자가 담당합니다.
+
+    사용 예:
+        def handle(text: str):
+            print("전사:", text)
+
+        core = ASRCore(config, on_transcription=handle)
+        core.push(chunk_float32)
+    """
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        on_transcription: Callable[[str], None],
+    ):
+        self.config = config
+        self.on_transcription = on_transcription
+        self.transcriber = WhisperTranscriber(config)
+        self.vad = EnergyVAD(threshold=config.vad_threshold)
+        self.buffer = SpeechBuffer(config=config)
+
+    def push(self, chunk: np.ndarray):
+        """float32 PCM 청크 1개를 입력. 발화 완성 시 콜백 호출 (별도 스레드에서)."""
+        is_speech = self.vad.is_speech(chunk)
+        audio = self.buffer.push(chunk, is_speech)
+        if audio is not None:
+            t = threading.Thread(target=self._transcribe, args=(audio,), daemon=True)
+            t.start()
+
+    def _transcribe(self, audio: np.ndarray):
+        text = self.transcriber.transcribe(audio)
+        if text.strip():
+            self.on_transcription(text.strip())
+
+
+# ---------------------------------------------------------------------------
+# WebSocket 모드 — 오디오 수신 후 텍스트 콜백
 # ---------------------------------------------------------------------------
 
 class RealtimeASRPipeline:
-    def __init__(self, config: Optional[PipelineConfig] = None):
-        self.config = config or PipelineConfig()
-        self.transcriber = WhisperTranscriber(self.config)
-        self.vad = EnergyVAD(threshold=self.config.vad_threshold)
-        self.speech_buffer = SpeechBuffer(config=self.config)
+    """
+    백엔드 WebSocket에 클라이언트로 연결해 오디오를 수신하고,
+    전사 결과를 on_transcription 콜백으로 반환합니다.
+    """
 
-        self._audio_queue: queue.Queue = queue.Queue()
-        self._result_queue: queue.Queue = queue.Queue()
+    def __init__(
+        self,
+        config: Optional[PipelineConfig] = None,
+        on_transcription: Optional[Callable[[str], None]] = None,
+    ):
+        self.config = config or PipelineConfig()
+        self.on_transcription = on_transcription or (lambda text: print(f"[ASR] {text}"))
         self._stop_event = threading.Event()
 
-    # ── 오디오 수신 ─────────────────────────────────────────────────────────
-
-    def _bytes_to_float32(self, raw_bytes: bytes) -> np.ndarray:
-        """
-        백엔드에서 받은 raw bytes -> float32 PCM.
-        백엔드 포맷에 따라 int16 또는 float32로 변경하세요.
-        """
+    @staticmethod
+    def _bytes_to_float32(raw_bytes: bytes) -> np.ndarray:
         pcm_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
         return pcm_int16.astype(np.float32) / 32768.0
 
-    async def _receive_audio(self, websocket):
-        """WebSocket에서 오디오 청크를 받아 큐에 적재"""
-        async for message in websocket:
-            if isinstance(message, bytes):
-                chunk = self._bytes_to_float32(message)
-            else:
-                # JSON 래핑된 경우: {"audio": "<base64>"}
-                import base64
-                data = json.loads(message)
-                raw = base64.b64decode(data["audio"])
-                chunk = self._bytes_to_float32(raw)
-
-            self._audio_queue.put(chunk)
-
-    # ── VAD + 버퍼링 (별도 스레드) ──────────────────────────────────────────
-
-    def _vad_worker(self):
-        while not self._stop_event.is_set():
-            try:
-                chunk = self._audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            is_speech = self.vad.is_speech(chunk)
-            audio = self.speech_buffer.push(chunk, is_speech)
-
-            if audio is not None:
-                self._transcribe_worker(audio)
-
-    def _transcribe_worker(self, audio: np.ndarray):
-        """동기 전사 호출 (VAD 스레드 내에서 실행)"""
-        start = time.time()
-        text = self.transcriber.transcribe(audio)
-        elapsed = time.time() - start
-
-        if text.strip():
-            result = {
-                "text": text.strip(),
-                "duration_s": round(len(audio) / self.config.sample_rate, 2),
-                "latency_s": round(elapsed, 2),
-                "timestamp": time.time(),
-            }
-            print(f"[ASR] ({elapsed:.2f}s) {text.strip()}")
-            self._result_queue.put(result)
-
-    # ── 결과 전송 ───────────────────────────────────────────────────────────
-
-    async def _send_results(self, websocket):
-        """전사 결과를 WebSocket으로 백엔드에 전송"""
-        loop = asyncio.get_event_loop()
-        while not self._stop_event.is_set():
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: self._result_queue.get(timeout=0.1)
-                )
-                await websocket.send(json.dumps(result, ensure_ascii=False))
-            except queue.Empty:
-                continue
-            except websockets.exceptions.ConnectionClosed:
-                break
-
-    # ── 실행 ────────────────────────────────────────────────────────────────
-
     async def run(self):
-        """파이프라인 실행 (단일 WebSocket에서 수신+송신)"""
-        vad_thread = threading.Thread(target=self._vad_worker, daemon=True)
-        vad_thread.start()
+        core = ASRCore(self.config, self.on_transcription)
 
         print(f"[Pipeline] 백엔드 연결 시도: {self.config.ws_uri}")
         async with websockets.connect(self.config.ws_uri) as ws:
             print("[Pipeline] 연결 완료. 오디오 수신 중...")
-            await asyncio.gather(
-                self._receive_audio(ws),
-                self._send_results(ws),
-            )
+            async for message in ws:
+                if isinstance(message, bytes):
+                    chunk = self._bytes_to_float32(message)
+                else:
+                    import base64
+                    raw = base64.b64decode(json.loads(message)["audio"])
+                    chunk = self._bytes_to_float32(raw)
+                core.push(chunk)
 
     def stop(self):
         self._stop_event.set()
 
 
 # ---------------------------------------------------------------------------
-# 백엔드가 클라이언트로 연결해 오는 경우 (서버 모드)
+# WebSocket 서버 모드 — 백엔드가 연결해 오는 구조
 # ---------------------------------------------------------------------------
 
 class RealtimeASRServer:
     """
     백엔드가 WebSocket 클라이언트로 이 서버에 연결하는 구조.
-    백엔드 → 오디오 → ASR서버 → 텍스트 → 백엔드
+    전사 결과는 on_transcription 콜백으로 반환합니다.
+    on_transcription이 None이면 콘솔에 출력합니다.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8765, config: Optional[PipelineConfig] = None):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        config: Optional[PipelineConfig] = None,
+        on_transcription: Optional[Callable[[str], None]] = None,
+    ):
         self.host = host
         self.port = port
         self.config = config or PipelineConfig()
-        self.transcriber = WhisperTranscriber(self.config)
+        self.on_transcription = on_transcription or (lambda text: print(f"[ASR] {text}"))
 
     async def _handle_client(self, websocket, path: str = "/"):
         print(f"[Server] 클라이언트 연결: {websocket.remote_address}")
-        vad = EnergyVAD(threshold=self.config.vad_threshold)
-        buffer = SpeechBuffer(config=self.config)
-
-        async def bytes_to_float32(raw: bytes) -> np.ndarray:
-            pcm_int16 = np.frombuffer(raw, dtype=np.int16)
-            return pcm_int16.astype(np.float32) / 32768.0
 
         loop = asyncio.get_event_loop()
+        core = ASRCore(
+            self.config,
+            on_transcription=self.on_transcription,
+        )
 
         async for message in websocket:
             if isinstance(message, bytes):
-                chunk = await bytes_to_float32(message)
+                raw = message
             else:
                 data = json.loads(message)
                 if data.get("type") == "end":
                     break
                 import base64
                 raw = base64.b64decode(data["audio"])
-                chunk = await bytes_to_float32(raw)
 
-            is_speech = vad.is_speech(chunk)
-            audio = buffer.push(chunk, is_speech)
-
-            if audio is not None:
-                # 전사는 executor에서 실행 (블로킹 방지)
-                text = await loop.run_in_executor(
-                    None, self.transcriber.transcribe, audio
-                )
-                if text.strip():
-                    result = {
-                        "text": text.strip(),
-                        "duration_s": round(len(audio) / self.config.sample_rate, 2),
-                        "timestamp": time.time(),
-                    }
-                    await websocket.send(json.dumps(result, ensure_ascii=False))
-                    print(f"[Server] 전송: {text.strip()}")
+            pcm_int16 = np.frombuffer(raw, dtype=np.int16)
+            chunk = pcm_int16.astype(np.float32) / 32768.0
+            # push는 내부적으로 별도 스레드에서 전사 실행
+            await loop.run_in_executor(None, core.push, chunk)
 
         print(f"[Server] 클라이언트 종료: {websocket.remote_address}")
 
@@ -365,22 +339,43 @@ class MicrophoneASRTest:
     """
     백엔드 연결 없이 실제 마이크 입력으로 ASR 파이프라인을 테스트하는 클래스.
 
+    on_transcription 콜백을 지정하면 전사 텍스트를 외부로 전달할 수 있습니다.
+    지정하지 않으면 콘솔에 출력합니다.
+
     필요 패키지:
         pip install sounddevice
 
     사용 예:
+        # 콘솔 출력만
         tester = MicrophoneASRTest()
-        tester.list_devices()          # 사용 가능한 마이크 목록 출력
-        tester.run(device=None)        # None이면 시스템 기본 마이크 사용
+        tester.run()
+
+        # 콜백으로 텍스트 받기 (LLM 연동 등)
+        def send_to_llm(text: str): ...
+        tester = MicrophoneASRTest(on_transcription=send_to_llm)
+        tester.run()
     """
 
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(
+        self,
+        config: Optional[PipelineConfig] = None,
+        on_transcription: Optional[Callable[[str], None]] = None,
+    ):
         self.config = config or PipelineConfig()
-        self.transcriber = WhisperTranscriber(self.config)
-        self.vad = EnergyVAD(threshold=self.config.vad_threshold)
-        self.speech_buffer = SpeechBuffer(config=self.config)
+        self._on_transcription = on_transcription  # None이면 기본 출력 사용
+        self._core: Optional[ASRCore] = None
         self._stop_event = threading.Event()
         self._transcript_history: list[dict] = []
+
+    def _handle_transcription(self, text: str):
+        """전사 완료 시 호출 — 히스토리 저장 후 콜백 또는 기본 출력"""
+        entry = {"text": text, "timestamp": time.strftime("%H:%M:%S")}
+        self._transcript_history.append(entry)
+
+        if self._on_transcription:
+            self._on_transcription(text)
+        else:
+            print(f"\n[{entry['timestamp']}] >> {text}\n")
 
     # ── 디바이스 확인 ────────────────────────────────────────────────────────
 
@@ -405,40 +400,14 @@ class MicrophoneASRTest:
         if status:
             print(f"[MicTest] 스트림 상태: {status}", flush=True)
 
-        # indata shape: (frames, channels) → mono float32 1D
-        chunk = indata[:, 0].copy()
+        chunk = indata[:, 0].copy()  # mono float32
 
-        is_speech = self.vad.is_speech(chunk)
-        audio = self.speech_buffer.push(chunk, is_speech)
-
-        # VAD 상태 표시 (터미널 시각화)
-        indicator = "█" if is_speech else "·"
+        # VAD 상태 표시
+        indicator = "█" if self._core.vad.is_speech(chunk) else "·"
         print(indicator, end="", flush=True)
 
-        if audio is not None:
-            print()  # VAD 표시줄 줄바꿈
-            # 전사는 별도 스레드에서 (콜백을 블로킹하지 않기 위해)
-            t = threading.Thread(target=self._transcribe_and_print, args=(audio,), daemon=True)
-            t.start()
-
-    def _transcribe_and_print(self, audio: np.ndarray):
-        duration = len(audio) / self.config.sample_rate
-        print(f"\n[MicTest] 전사 중... ({duration:.1f}초 분량)")
-        start = time.time()
-        text = self.transcriber.transcribe(audio)
-        elapsed = time.time() - start
-
-        if text.strip():
-            entry = {
-                "text": text.strip(),
-                "duration_s": round(duration, 2),
-                "latency_s": round(elapsed, 2),
-                "timestamp": time.strftime("%H:%M:%S"),
-            }
-            self._transcript_history.append(entry)
-            print(f"[{entry['timestamp']}] ({elapsed:.2f}s) >> {text.strip()}\n")
-        else:
-            print("[MicTest] (인식 결과 없음)\n")
+        # ASRCore.push → 발화 완성 시 _handle_transcription 호출
+        self._core.push(chunk)
 
     # ── 실행 ────────────────────────────────────────────────────────────────
 
@@ -454,22 +423,23 @@ class MicrophoneASRTest:
 
         self._stop_event.clear()
         self._transcript_history.clear()
+        self._core = ASRCore(self.config, on_transcription=self._handle_transcription)
 
         print("\n" + "=" * 60)
         print("  Real-time Whisper ASR — 마이크 테스트")
         print(f"  모델: {self.config.model_size} | 언어: {self.config.language}")
         print(f"  VAD 임계값: {self.config.vad_threshold} | 묵음 판정: {self.config.silence_duration_s}s")
+        if self._on_transcription:
+            print("  콜백 모드: 전사 텍스트를 on_transcription으로 전달")
         print("  [█ = 발화  · = 묵음]  Ctrl+C 로 종료")
         print("=" * 60 + "\n")
-
-        chunk_samples = self.config.chunk_samples
 
         try:
             with sd.InputStream(
                 samplerate=self.config.sample_rate,
                 channels=self.config.channels,
                 dtype="float32",
-                blocksize=chunk_samples,
+                blocksize=self.config.chunk_samples,
                 device=device,
                 callback=self._audio_callback,
             ):
@@ -494,7 +464,6 @@ class MicrophoneASRTest:
         print("=" * 60)
         for i, entry in enumerate(self._transcript_history, 1):
             print(f"  [{i:>2}] {entry['timestamp']}  {entry['text']}")
-            print(f"        (발화 {entry['duration_s']}s → 전사 {entry['latency_s']}s)")
         print("=" * 60)
 
     def get_transcript_history(self) -> list[dict]:
