@@ -2,50 +2,71 @@
 Real-time ASR Pipeline using Whisper
 
 Architecture:
-  Audio source --> VAD --> SpeechBuffer --> WhisperTranscriber --> str (text)
+  Audio source --> VAD --> SpeechBuffer --> WhisperTranscriber --> TranscriptionResult callback
 
-전사된 텍스트는 on_transcription 콜백으로 전달됩니다.
+전사된 텍스트(+ 신뢰도)는 on_transcription 콜백으로 전달됩니다.
 이후 처리(LLM 전달, 저장, WebSocket 송신 등)는 호출자가 담당합니다.
 """
 
 import asyncio
 import json
+import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, TypedDict
 
 import numpy as np
 import websockets
+from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+
+load_dotenv()             # .env (공통 설정, git 커밋 O)
+load_dotenv(".env.local", override=True)  # .env.local (민감 정보, git 커밋 X)
+
+# ---------------------------------------------------------------------------
+# 결과 타입
+# ---------------------------------------------------------------------------
+
+class TranscriptionResult(TypedDict):
+    text: str           # 전사된 텍스트
+    confidence: float   # 세그먼트 평균 log-prob → exp 정규화 [0, 1]
+    language: str       # 감지/설정된 언어 코드 (예: "ko")
+
 
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
 
+def _env(key: str, default: str) -> str:
+    """환경변수 값을 반환. 없으면 default."""
+    return os.environ.get(key, default)
+
+
 @dataclass
 class PipelineConfig:
     # WebSocket
-    ws_uri: str = "ws://localhost:8080/audio"   # 백엔드 WebSocket 주소
-    result_uri: str = "ws://localhost:8080/asr"  # 결과 전송 주소 (같은 소켓 사용 가능)
+    ws_uri: str = _env("WS_URI", "ws://localhost:8080/audio")
+    result_uri: str = "ws://localhost:8080/asr"
 
     # 오디오
-    sample_rate: int = 16000          # Whisper 기본 sample rate
-    channels: int = 1
-    chunk_duration_ms: int = 30       # 한 청크 길이 (ms)
+    sample_rate: int = int(_env("AUDIO_SAMPLE_RATE", "16000"))
+    channels: int = int(_env("AUDIO_CHANNELS", "1"))
+    chunk_duration_ms: int = int(_env("AUDIO_CHUNK_DURATION_MS", "30"))
 
-    # VAD (Silero-VAD 기반 간단 에너지 VAD 대체 가능)
-    vad_threshold: float = 0.02       # RMS 에너지 임계값
-    silence_duration_s: float = 0.8   # 이 시간 동안 조용하면 발화 종료로 판단
-    min_speech_duration_s: float = 0.3  # 최소 발화 길이 (너무 짧은 노이즈 무시)
-    max_buffer_duration_s: float = 30   # 최대 버퍼 길이 (강제 전사)
+    # VAD
+    vad_threshold: float = float(_env("VAD_THRESHOLD", "0.02"))
+    silence_duration_s: float = float(_env("VAD_SILENCE_DURATION_S", "0.8"))
+    min_speech_duration_s: float = float(_env("VAD_MIN_SPEECH_DURATION_S", "0.3"))
+    max_buffer_duration_s: float = float(_env("VAD_MAX_BUFFER_DURATION_S", "30.0"))
 
-    # Whisper
-    model_size: str = "base"          # tiny / base / small / medium / large-v3
-    device: str = "auto"              # auto / cpu / cuda
-    compute_type: str = "auto"        # auto / int8 / float16
-    language: str = "ko"              # None이면 자동 감지
-    beam_size: int = 5
+    # Whisper — HuggingFace 모델명(예: "base") 또는 로컬 faster-whisper 디렉터리 경로
+    model: str = _env("ASR_MODEL", "base")
+    device: str = _env("ASR_DEVICE", "auto")
+    compute_type: str = _env("ASR_COMPUTE_TYPE", "auto")
+    language: str = _env("ASR_LANGUAGE", "ko")
+    beam_size: int = int(_env("ASR_BEAM_SIZE", "5"))
 
     @property
     def chunk_samples(self) -> int:
@@ -88,9 +109,6 @@ class SileroVAD:
         self.get_speech_timestamps = self.utils[0]
         self.sample_rate = sample_rate
         self.threshold = threshold
-        self._h = None
-        self._c = None
-        import torch
         self.torch = torch
 
     def is_speech(self, pcm_float32: np.ndarray) -> bool:
@@ -118,26 +136,47 @@ class WhisperTranscriber:
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
 
-        print(f"[Whisper] 모델 로딩: {config.model_size} | device={device} | compute={compute_type}")
+        print(f"[Whisper] 모델 로딩: {config.model} | device={device} | compute={compute_type}")
         self.model = WhisperModel(
-            config.model_size,
+            config.model,
             device=device,
             compute_type=compute_type,
         )
         self.config = config
         print("[Whisper] 모델 로딩 완료")
 
-    def transcribe(self, pcm_float32: np.ndarray) -> str:
-        """float32 PCM numpy 배열 -> 전사 텍스트"""
-        segments, info = self.model.transcribe(
+    def transcribe(self, pcm_float32: np.ndarray) -> TranscriptionResult:
+        """float32 PCM numpy 배열 → TranscriptionResult (텍스트 + 신뢰도 + 언어)"""
+        segments_gen, info = self.model.transcribe(
             pcm_float32,
             beam_size=self.config.beam_size,
             language=self.config.language,
             vad_filter=True,          # faster-whisper 내장 VAD 필터
             vad_parameters=dict(min_silence_duration_ms=500),
         )
+        segments = list(segments_gen)  # generator 소비
+
         text = " ".join(seg.text.strip() for seg in segments)
-        return text
+
+        # confidence: 세그먼트 길이 가중 평균 exp(avg_logprob) → [0, 1]
+        if segments:
+            total_duration = sum(seg.end - seg.start for seg in segments)
+            if total_duration > 0:
+                confidence = sum(
+                    math.exp(seg.avg_logprob) * (seg.end - seg.start)
+                    for seg in segments
+                ) / total_duration
+            else:
+                confidence = math.exp(segments[0].avg_logprob)
+            confidence = max(0.0, min(1.0, confidence))
+        else:
+            confidence = 0.0
+
+        return TranscriptionResult(
+            text=text,
+            confidence=confidence,
+            language=info.language or self.config.language,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +229,7 @@ class SpeechBuffer:
 
 
 # ---------------------------------------------------------------------------
-# 공통 ASR 코어 (오디오 → 텍스트 변환만 담당)
+# 공통 ASR 코어 (오디오 → TranscriptionResult 변환만 담당)
 # ---------------------------------------------------------------------------
 
 class ASRCore:
@@ -198,11 +237,11 @@ class ASRCore:
     VAD + SpeechBuffer + WhisperTranscriber를 묶은 핵심 ASR 유닛.
 
     오디오 청크를 push()하면 발화가 완성될 때마다 on_transcription 콜백으로
-    전사된 텍스트(str)를 전달합니다. 이후 처리는 호출자가 담당합니다.
+    TranscriptionResult(텍스트 + 신뢰도 + 언어)를 전달합니다.
 
     사용 예:
-        def handle(text: str):
-            print("전사:", text)
+        def handle(result: TranscriptionResult):
+            print("전사:", result["text"], "신뢰도:", result["confidence"])
 
         core = ASRCore(config, on_transcription=handle)
         core.push(chunk_float32)
@@ -211,7 +250,7 @@ class ASRCore:
     def __init__(
         self,
         config: PipelineConfig,
-        on_transcription: Callable[[str], None],
+        on_transcription: Callable[[TranscriptionResult], None],
     ):
         self.config = config
         self.on_transcription = on_transcription
@@ -228,28 +267,34 @@ class ASRCore:
             t.start()
 
     def _transcribe(self, audio: np.ndarray):
-        text = self.transcriber.transcribe(audio)
-        if text.strip():
-            self.on_transcription(text.strip())
+        result = self.transcriber.transcribe(audio)
+        if result["text"].strip():
+            self.on_transcription(result)
 
 
 # ---------------------------------------------------------------------------
-# WebSocket 모드 — 오디오 수신 후 텍스트 콜백
+# WebSocket 모드 — 오디오 수신 후 TranscriptionResult 콜백
 # ---------------------------------------------------------------------------
 
 class RealtimeASRPipeline:
     """
     백엔드 WebSocket에 클라이언트로 연결해 오디오를 수신하고,
     전사 결과를 on_transcription 콜백으로 반환합니다.
+    연결 끊김 시 지수 백오프(1→2→4→8→…→60초)로 재연결합니다.
     """
+
+    _RECONNECT_BASE_DELAY = 1.0
+    _RECONNECT_MAX_DELAY = 60.0
 
     def __init__(
         self,
         config: Optional[PipelineConfig] = None,
-        on_transcription: Optional[Callable[[str], None]] = None,
+        on_transcription: Optional[Callable[[TranscriptionResult], None]] = None,
     ):
         self.config = config or PipelineConfig()
-        self.on_transcription = on_transcription or (lambda text: print(f"[ASR] {text}"))
+        self.on_transcription = on_transcription or (
+            lambda r: print(f"[ASR] {r['text']} (confidence={r['confidence']:.3f})")
+        )
         self._stop_event = threading.Event()
 
     @staticmethod
@@ -259,18 +304,28 @@ class RealtimeASRPipeline:
 
     async def run(self):
         core = ASRCore(self.config, self.on_transcription)
+        delay = self._RECONNECT_BASE_DELAY
 
-        print(f"[Pipeline] 백엔드 연결 시도: {self.config.ws_uri}")
-        async with websockets.connect(self.config.ws_uri) as ws:
-            print("[Pipeline] 연결 완료. 오디오 수신 중...")
-            async for message in ws:
-                if isinstance(message, bytes):
-                    chunk = self._bytes_to_float32(message)
-                else:
-                    import base64
-                    raw = base64.b64decode(json.loads(message)["audio"])
-                    chunk = self._bytes_to_float32(raw)
-                core.push(chunk)
+        while not self._stop_event.is_set():
+            try:
+                print(f"[Pipeline] 백엔드 연결 시도: {self.config.ws_uri}")
+                async with websockets.connect(self.config.ws_uri) as ws:
+                    print("[Pipeline] 연결 완료. 오디오 수신 중...")
+                    delay = self._RECONNECT_BASE_DELAY  # 연결 성공 시 딜레이 초기화
+                    async for message in ws:
+                        if isinstance(message, bytes):
+                            chunk = self._bytes_to_float32(message)
+                        else:
+                            import base64
+                            raw = base64.b64decode(json.loads(message)["audio"])
+                            chunk = self._bytes_to_float32(raw)
+                        core.push(chunk)
+            except (websockets.exceptions.ConnectionClosed, OSError) as e:
+                if self._stop_event.is_set():
+                    break
+                print(f"[Pipeline] 연결 끊김: {e}. {delay:.0f}초 후 재연결...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._RECONNECT_MAX_DELAY)
 
     def stop(self):
         self._stop_event.set()
@@ -292,12 +347,14 @@ class RealtimeASRServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         config: Optional[PipelineConfig] = None,
-        on_transcription: Optional[Callable[[str], None]] = None,
+        on_transcription: Optional[Callable[[TranscriptionResult], None]] = None,
     ):
         self.host = host
         self.port = port
         self.config = config or PipelineConfig()
-        self.on_transcription = on_transcription or (lambda text: print(f"[ASR] {text}"))
+        self.on_transcription = on_transcription or (
+            lambda r: print(f"[ASR] {r['text']} (confidence={r['confidence']:.3f})")
+        )
 
     async def _handle_client(self, websocket, path: str = "/"):
         print(f"[Server] 클라이언트 연결: {websocket.remote_address}")
@@ -320,7 +377,6 @@ class RealtimeASRServer:
 
             pcm_int16 = np.frombuffer(raw, dtype=np.int16)
             chunk = pcm_int16.astype(np.float32) / 32768.0
-            # push는 내부적으로 별도 스레드에서 전사 실행
             await loop.run_in_executor(None, core.push, chunk)
 
         print(f"[Server] 클라이언트 종료: {websocket.remote_address}")
@@ -339,7 +395,7 @@ class MicrophoneASRTest:
     """
     백엔드 연결 없이 실제 마이크 입력으로 ASR 파이프라인을 테스트하는 클래스.
 
-    on_transcription 콜백을 지정하면 전사 텍스트를 외부로 전달할 수 있습니다.
+    on_transcription 콜백을 지정하면 TranscriptionResult를 외부로 전달할 수 있습니다.
     지정하지 않으면 콘솔에 출력합니다.
 
     필요 패키지:
@@ -350,8 +406,8 @@ class MicrophoneASRTest:
         tester = MicrophoneASRTest()
         tester.run()
 
-        # 콜백으로 텍스트 받기 (LLM 연동 등)
-        def send_to_llm(text: str): ...
+        # 콜백으로 결과 받기 (LLM 연동 등)
+        def send_to_llm(result: TranscriptionResult): ...
         tester = MicrophoneASRTest(on_transcription=send_to_llm)
         tester.run()
     """
@@ -359,7 +415,7 @@ class MicrophoneASRTest:
     def __init__(
         self,
         config: Optional[PipelineConfig] = None,
-        on_transcription: Optional[Callable[[str], None]] = None,
+        on_transcription: Optional[Callable[[TranscriptionResult], None]] = None,
     ):
         self.config = config or PipelineConfig()
         self._on_transcription = on_transcription  # None이면 기본 출력 사용
@@ -367,15 +423,20 @@ class MicrophoneASRTest:
         self._stop_event = threading.Event()
         self._transcript_history: list[dict] = []
 
-    def _handle_transcription(self, text: str):
+    def _handle_transcription(self, result: TranscriptionResult):
         """전사 완료 시 호출 — 히스토리 저장 후 콜백 또는 기본 출력"""
-        entry = {"text": text, "timestamp": time.strftime("%H:%M:%S")}
+        entry = {
+            "text": result["text"],
+            "confidence": result["confidence"],
+            "language": result["language"],
+            "timestamp": time.strftime("%H:%M:%S"),
+        }
         self._transcript_history.append(entry)
 
         if self._on_transcription:
-            self._on_transcription(text)
+            self._on_transcription(result)
         else:
-            print(f"\n[{entry['timestamp']}] >> {text}\n")
+            print(f"\n[{entry['timestamp']}] >> {entry['text']}  (conf={entry['confidence']:.3f})\n")
 
     # ── 디바이스 확인 ────────────────────────────────────────────────────────
 
@@ -427,10 +488,10 @@ class MicrophoneASRTest:
 
         print("\n" + "=" * 60)
         print("  Real-time Whisper ASR — 마이크 테스트")
-        print(f"  모델: {self.config.model_size} | 언어: {self.config.language}")
+        print(f"  모델: {self.config.model} | 언어: {self.config.language}")
         print(f"  VAD 임계값: {self.config.vad_threshold} | 묵음 판정: {self.config.silence_duration_s}s")
         if self._on_transcription:
-            print("  콜백 모드: 전사 텍스트를 on_transcription으로 전달")
+            print("  콜백 모드: 전사 결과를 on_transcription으로 전달")
         print("  [█ = 발화  · = 묵음]  Ctrl+C 로 종료")
         print("=" * 60 + "\n")
 
@@ -463,7 +524,7 @@ class MicrophoneASRTest:
         print(f"  전사 결과 요약 (총 {len(self._transcript_history)}건)")
         print("=" * 60)
         for i, entry in enumerate(self._transcript_history, 1):
-            print(f"  [{i:>2}] {entry['timestamp']}  {entry['text']}")
+            print(f"  [{i:>2}] {entry['timestamp']}  {entry['text']}  (conf={entry['confidence']:.3f})")
         print("=" * 60)
 
     def get_transcript_history(self) -> list[dict]:
@@ -485,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--ws-uri", default="ws://localhost:8080/audio")
     parser.add_argument("--model", default="base",
-                        choices=["tiny", "base", "small", "medium", "large-v3"])
+                        help="HuggingFace 모델명(tiny/base/small/medium/large-v3) 또는 로컬 경로")
     parser.add_argument("--language", default="ko")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--mic-device", type=int, default=None,
@@ -500,7 +561,7 @@ if __name__ == "__main__":
 
     config = PipelineConfig(
         ws_uri=args.ws_uri,
-        model_size=args.model,
+        model=args.model,
         language=args.language,
         device=args.device,
     )

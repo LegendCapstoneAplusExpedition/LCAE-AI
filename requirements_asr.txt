@@ -2,6 +2,7 @@ faster-whisper>=1.0.0
 websockets>=12.0
 numpy>=1.24.0
 sounddevice>=0.4.6       # 마이크 테스트(MicrophoneASRTest) 용
+python-dotenv>=1.0.0     # .env 파일 로드
 # GPU 사용 시 (선택)
 # torch>=2.0.0
 # Silero-VAD 사용 시 (선택, 더 정확한 VAD)
