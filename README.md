@@ -1,2 +1,2 @@
-# Capstone2026-1
-2026캡스톤
+# LCAE-AE
+LCAE AI파트 레포지토리 입니다.
