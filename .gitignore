@@ -1,0 +1,54 @@
+CLAUDE.md
+
+# 민감 정보 (API 키 등) — 로컬 전용
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# 가상환경
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 모델 캐시 (faster-whisper / Hugging Face)
+models/
+*.bin
+*.pt
+*.ckpt
+huggingface/
+.cache/
+
+# 로그 / 임시
+*.log
+*.tmp
+tmp/
+logs/
+
+# 오디오 테스트 파일
+*.wav
+*.mp3
+*.ogg
+*.flac
