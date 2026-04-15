@@ -112,6 +112,14 @@ class SileroVAD:
         self.torch = torch
 
     def is_speech(self, pcm_float32: np.ndarray) -> bool:
+        # Silero VAD requires fixed chunk sizes: 512 samples @ 16kHz, 256 @ 8kHz
+        required = 512 if self.sample_rate == 16000 else 256
+        if len(pcm_float32) != required:
+            padded = np.zeros(required, dtype=np.float32)
+            n = min(len(pcm_float32), required)
+            padded[:n] = pcm_float32[:n]
+            pcm_float32 = padded
+        #energyVAD
         tensor = self.torch.from_numpy(pcm_float32)
         speech_prob = self.model(tensor, self.sample_rate).item()
         return speech_prob >= self.threshold
@@ -127,7 +135,7 @@ class WhisperTranscriber:
         compute_type = config.compute_type
 
         # device/compute_type 자동 설정
-        if device == "auto":
+        if device == "auto": 
             try:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -255,7 +263,7 @@ class ASRCore:
         self.config = config
         self.on_transcription = on_transcription
         self.transcriber = WhisperTranscriber(config)
-        self.vad = EnergyVAD(threshold=config.vad_threshold)
+        self.vad = SileroVAD(sample_rate= config.sample_rate)
         self.buffer = SpeechBuffer(config=config)
 
     def push(self, chunk: np.ndarray):
@@ -461,7 +469,7 @@ class MicrophoneASRTest:
         if status:
             print(f"[MicTest] 스트림 상태: {status}", flush=True)
 
-        chunk = indata[:, 0].copy()  # mono float32
+        chunk = indata[:, 0].copy()  # mono float32rr
 
         # VAD 상태 표시
         indicator = "█" if self._core.vad.is_speech(chunk) else "·"

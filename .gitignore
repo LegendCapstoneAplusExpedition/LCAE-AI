@@ -52,3 +52,6 @@ logs/
 *.mp3
 *.ogg
 *.flac
+
+#클로드 무시
+.claudeignore

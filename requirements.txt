@@ -11,4 +11,5 @@ coqui-tts>=0.22.0        # Coqui TTS 엔진 (pipeline/tts)
 # torch>=2.0.0
 
 # Silero-VAD 사용 시 (선택, 더 정확한 VAD)
-# torch>=2.0.0
+torch>=2.0.0
+torchaudio>=2.11.0
