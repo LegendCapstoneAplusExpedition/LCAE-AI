@@ -13,3 +13,8 @@ coqui-tts>=0.22.0        # Coqui TTS 엔진 (pipeline/tts)
 # Silero-VAD 사용 시 (선택, 더 정확한 VAD)
 torch>=2.0.0
 torchaudio>=2.11.0
+
+#ASR Finetuning
+datasets>=2.6.1
+evaluate>=0.30
+acclerate>=1.13.0
