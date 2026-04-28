@@ -52,6 +52,30 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
+def _env_int(key: str, default: int) -> int:
+    """환경변수를 int로 반환. 없거나 변환 실패 시 default."""
+    try:
+        return int(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    """환경변수를 float로 반환. 없거나 변환 실패 시 default."""
+    try:
+        return float(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """환경변수를 bool로 반환. 'true'/'1'/'yes' → True, 나머지 → False."""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("true", "1", "yes")
+
+
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
@@ -74,40 +98,88 @@ class FinetuningConfig:
     task: str = "transcribe"
 
     # 데이터셋
-    dataset_name: str = "mozilla-foundation/common_voice_11_0"
-    dataset_config: str = "ko"              # HuggingFace dataset config 이름
-    dataset_split_train: str = "train+validation"
-    dataset_split_test: str = "test"
-    audio_column: str = "audio"
-    text_column: str = "sentence"
-    max_label_length: int = 448             # Whisper 디코더 최대 토큰 길이
+    dataset_name: str = field(
+        default_factory=lambda: _env(
+            "FT_DATASET_NAME", "mozilla-foundation/common_voice_17_0"
+        )
+    )
+    dataset_config: str = field(
+        default_factory=lambda: _env("FT_DATASET_CONFIG", "ko")
+    )
+    dataset_split_train: str = field(
+        default_factory=lambda: _env("FT_DATASET_SPLIT_TRAIN", "train+validation")
+    )
+    dataset_split_test: str = field(
+        default_factory=lambda: _env("FT_DATASET_SPLIT_TEST", "test")
+    )
+    audio_column: str = field(
+        default_factory=lambda: _env("FT_AUDIO_COLUMN", "audio")
+    )
+    text_column: str = field(
+        default_factory=lambda: _env("FT_TEXT_COLUMN", "sentence")
+    )
+    max_label_length: int = field(
+        default_factory=lambda: _env_int("FT_MAX_LABEL_LENGTH", 448)
+    )
 
     # 학습
-    output_dir: str = "./checkpoints"
-    num_train_epochs: int = 3
-    per_device_train_batch_size: int = 8
-    per_device_eval_batch_size: int = 8
-    gradient_accumulation_steps: int = 2
-    learning_rate: float = 1e-5
-    warmup_steps: int = 500
-    max_steps: int = -1                     # -1 = num_train_epochs 기준
+    output_dir: str = field(
+        default_factory=lambda: _env("FT_OUTPUT_DIR", "./checkpoints")
+    )
+    num_train_epochs: int = field(
+        default_factory=lambda: _env_int("FT_EPOCHS", 3)
+    )
+    per_device_train_batch_size: int = field(
+        default_factory=lambda: _env_int("FT_TRAIN_BATCH_SIZE", 8)
+    )
+    per_device_eval_batch_size: int = field(
+        default_factory=lambda: _env_int("FT_EVAL_BATCH_SIZE", 8)
+    )
+    gradient_accumulation_steps: int = field(
+        default_factory=lambda: _env_int("FT_GRAD_ACCUM_STEPS", 2)
+    )
+    learning_rate: float = field(
+        default_factory=lambda: _env_float("FT_LEARNING_RATE", 1e-5)
+    )
+    warmup_steps: int = field(
+        default_factory=lambda: _env_int("FT_WARMUP_STEPS", 500)
+    )
+    max_steps: int = field(
+        default_factory=lambda: _env_int("FT_MAX_STEPS", -1)
+    )
     fp16: bool = field(
         default_factory=lambda: torch.cuda.is_available()
     )
     predict_with_generate: bool = True
-    generation_max_length: int = 448
-    save_steps: int = 1000
-    eval_steps: int = 1000
-    logging_steps: int = 25
+    generation_max_length: int = field(
+        default_factory=lambda: _env_int("FT_MAX_LABEL_LENGTH", 448)
+    )
+    save_steps: int = field(
+        default_factory=lambda: _env_int("FT_SAVE_STEPS", 1000)
+    )
+    eval_steps: int = field(
+        default_factory=lambda: _env_int("FT_EVAL_STEPS", 1000)
+    )
+    logging_steps: int = field(
+        default_factory=lambda: _env_int("FT_LOGGING_STEPS", 25)
+    )
     load_best_model_at_end: bool = True
     metric_for_best_model: str = "wer"
     greater_is_better: bool = False         # WER은 낮을수록 좋음
-    save_total_limit: int = 3
-    push_to_hub: bool = False
+    save_total_limit: int = field(
+        default_factory=lambda: _env_int("FT_SAVE_TOTAL_LIMIT", 3)
+    )
+    push_to_hub: bool = field(
+        default_factory=lambda: _env_bool("FT_PUSH_TO_HUB", False)
+    )
 
     # 변환 (CTranslate2)
-    converted_output_dir: str = "./faster-whisper-finetuned"
-    quantization: str = "int8"
+    converted_output_dir: str = field(
+        default_factory=lambda: _env("FT_CONVERTED_OUTPUT_DIR", "./faster-whisper-finetuned")
+    )
+    quantization: str = field(
+        default_factory=lambda: _env("FT_QUANTIZATION", "int8")
+    )
 
     @property
     def hf_model_size(self) -> str:
@@ -364,7 +436,7 @@ class WhisperFinetuner:
             eval_dataset=dataset["test"],
             data_collator=data_collator,
             compute_metrics=self._compute_metrics,
-            tokenizer=self.processor.feature_extractor,  # 저장 시 함께 보존
+            processing_class=self.processor.feature_extractor,  # 저장 시 함께 보존
         )
 
         logger.info("[WhisperFinetuner] 학습 시작...")
@@ -399,7 +471,7 @@ class WhisperFinetuner:
             greater_is_better=self.config.greater_is_better,
             save_total_limit=self.config.save_total_limit,
             push_to_hub=self.config.push_to_hub,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             save_strategy="steps",
             report_to="none",       # wandb / tensorboard 사용 시 변경
         )

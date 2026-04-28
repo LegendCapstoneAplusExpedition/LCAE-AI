@@ -1,6 +1,6 @@
-faster-whisper>=1.0.0
+faster-whisper>=1.2.0
 websockets>=12.0
-numpy>=1.24.0
+numpy>=1.24.4
 sounddevice>=0.4.6       # 마이크 테스트(MicrophoneASRTest) / 스피커 테스트(SpeakerTTSTest) 용
 python-dotenv>=1.0.0     # .env 파일 로드
 
@@ -11,10 +11,13 @@ coqui-tts>=0.22.0        # Coqui TTS 엔진 (pipeline/tts)
 # torch>=2.0.0
 
 # Silero-VAD 사용 시 (선택, 더 정확한 VAD)
-torch>=2.0.0
-torchaudio>=2.11.0
+torch>=2.3.1
+torchaudio>=2.3.1
 
 #ASR Finetuning
-datasets>=2.6.1
-evaluate>=0.30
-acclerate>=1.13.0
+datasets
+evaluate
+jiwer>=4.0.0
+torchcodec>=0.11.1
+accelerate
+transformers>=4.55.0
