@@ -55,3 +55,7 @@ logs/
 
 #클로드 무시
 .claudeignore
+
+#모델 무시
+checkpoints/
+faster-whisper-finetuned/

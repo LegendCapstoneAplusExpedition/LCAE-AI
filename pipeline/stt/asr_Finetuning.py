@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from datasets import Audio, DatasetDict, load_dataset
+from datasets import Audio, DatasetDict, concatenate_datasets, load_dataset
 from dotenv import load_dotenv
 from evaluate import load as load_metric
 from transformers import (
@@ -77,6 +77,62 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 데이터셋 스펙 (멀티 데이터셋 지원)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DatasetSpec:
+    """
+    단일 데이터셋 로드 설정.
+    Configuration for loading a single dataset.
+    """
+    name: str
+    config: str = ""
+    split_train: str = "train"
+    split_test: str = "test"
+    audio_column: str = "audio"
+    text_column: str = "text"
+
+
+def _parse_dataset_specs() -> List[DatasetSpec]:
+    """
+    환경변수에서 멀티 데이터셋 스펙을 파싱.
+    Parses multi-dataset specs from environment variables.
+
+    FT_DATASET_NAMES        : 쉼표 구분 데이터셋 이름 목록
+    FT_DATASET_CONFIGS      : 각 데이터셋의 HF config 이름 (없으면 빈 문자열)
+    FT_DATASET_SPLIT_TRAINS : 각 데이터셋의 학습 split
+    FT_DATASET_SPLIT_TESTS  : 각 데이터셋의 평가 split
+    FT_AUDIO_COLUMNS        : 각 데이터셋의 오디오 컬럼명
+    FT_TEXT_COLUMNS         : 각 데이터셋의 텍스트 컬럼명
+    """
+    def _split_env(key: str, default: str) -> List[str]:
+        return [v.strip() for v in _env(key, default).split(",")]
+
+    names   = [n for n in _split_env("FT_DATASET_NAMES", "Bingsu/zeroth-korean") if n]
+    configs = _split_env("FT_DATASET_CONFIGS", "")
+    trains  = _split_env("FT_DATASET_SPLIT_TRAINS", "train")
+    tests   = _split_env("FT_DATASET_SPLIT_TESTS", "test")
+    audios  = _split_env("FT_AUDIO_COLUMNS", "audio")
+    texts   = _split_env("FT_TEXT_COLUMNS", "text")
+
+    def _get(lst: List[str], i: int, default: str) -> str:
+        return lst[i] if i < len(lst) else default
+
+    return [
+        DatasetSpec(
+            name=name,
+            config=_get(configs, i, ""),
+            split_train=_get(trains, i, "train"),
+            split_test=_get(tests, i, "test"),
+            audio_column=_get(audios, i, "audio"),
+            text_column=_get(texts, i, "text"),
+        )
+        for i, name in enumerate(names)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
 
@@ -92,31 +148,14 @@ class FinetuningConfig:
 
     # 모델
     model_name: str = field(
-        default_factory=lambda: f"openai/whisper-{_env('ASR_MODEL', 'base')}"
+        default_factory=lambda: f"openai/whisper-{_env('ASR_MODEL', 'medium')}"
     )
     language: str = field(default_factory=lambda: _env("ASR_LANGUAGE", "ko"))
     task: str = "transcribe"
 
-    # 데이터셋
-    dataset_name: str = field(
-        default_factory=lambda: _env(
-            "FT_DATASET_NAME", "mozilla-foundation/common_voice_17_0"
-        )
-    )
-    dataset_config: str = field(
-        default_factory=lambda: _env("FT_DATASET_CONFIG", "ko")
-    )
-    dataset_split_train: str = field(
-        default_factory=lambda: _env("FT_DATASET_SPLIT_TRAIN", "train+validation")
-    )
-    dataset_split_test: str = field(
-        default_factory=lambda: _env("FT_DATASET_SPLIT_TEST", "test")
-    )
-    audio_column: str = field(
-        default_factory=lambda: _env("FT_AUDIO_COLUMN", "audio")
-    )
-    text_column: str = field(
-        default_factory=lambda: _env("FT_TEXT_COLUMN", "sentence")
+    # 데이터셋 (멀티 데이터셋)
+    datasets: List[DatasetSpec] = field(
+        default_factory=_parse_dataset_specs
     )
     max_label_length: int = field(
         default_factory=lambda: _env_int("FT_MAX_LABEL_LENGTH", 448)
@@ -148,7 +187,10 @@ class FinetuningConfig:
         default_factory=lambda: _env_int("FT_MAX_STEPS", -1)
     )
     fp16: bool = field(
-        default_factory=lambda: torch.cuda.is_available()
+    default_factory=lambda: False   # FP16은 Whisper와 충돌 → 비활성화
+    )
+    bf16: bool = field(
+        default_factory=lambda: torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     )
     predict_with_generate: bool = True
     generation_max_length: int = field(
@@ -242,15 +284,23 @@ class WhisperDataCollator:
 
 class KoreanDatasetLoader:
     """
-    한국어 음성 데이터셋 로더 및 전처리기.
-    Korean speech dataset loader and preprocessor.
+    한국어 음성 데이터셋 로더 및 전처리기 (멀티 데이터셋 지원).
+    Korean speech dataset loader and preprocessor with multi-dataset support.
 
     지원 데이터셋:
-    - mozilla-foundation/common_voice_11_0 (ko)  — 기본 fallback
-    - AIHub / KsponSpeech (로컬 경로, config.dataset_name에 경로 지정 시)
+    - Bingsu/zeroth-korean           — 기본 포함
+    - fsicoli/common_voice_22_0 (ko) — 기본 포함
+    - AIHub / KsponSpeech 등 로컬 audiofolder 경로
+
+    각 데이터셋은 DatasetSpec으로 설정하며, 전처리 후 자동 병합합니다.
     """
 
     SAMPLE_RATE: int = 16_000
+    # 불필요한 메타데이터 컬럼 (Common Voice 등)
+    _DROP_COLS = [
+        "accent", "age", "client_id", "down_votes", "gender",
+        "locale", "path", "segment", "up_votes", "variant",
+    ]
 
     def __init__(self, config: FinetuningConfig) -> None:
         self.config = config
@@ -262,100 +312,133 @@ class KoreanDatasetLoader:
 
     def load(self) -> DatasetDict:
         """
-        데이터셋 로드 → 전처리 → DatasetDict 반환.
-        Load dataset → preprocess → return DatasetDict.
+        설정된 모든 데이터셋을 로드·전처리·병합하여 DatasetDict 반환.
+        Loads, preprocesses, and merges all configured datasets into a DatasetDict.
         """
-        logger.info(
-            f"[KoreanDatasetLoader] 데이터셋 로드: {self.config.dataset_name}"
-        )
-        dataset = self._load_raw()
-
-        # 오디오 자동 리샘플링 (16kHz)
-        dataset = dataset.cast_column(
-            self.config.audio_column, Audio(sampling_rate=self.SAMPLE_RATE)
-        )
-
         # Windows에서 multiprocessing 사용 시 deadlock 위험 → num_proc=1
         num_proc = 1 if sys.platform == "win32" else os.cpu_count()
 
-        logger.info("[KoreanDatasetLoader] 특징 추출 및 토크나이징 중...")
-        dataset = dataset.map(
-            self._prepare_dataset,
-            remove_columns=dataset.column_names["train"],
-            num_proc=num_proc,
-        )
+        all_train, all_test = [], []
 
-        # 너무 긴 레이블 필터링
-        before = {k: len(v) for k, v in dataset.items()}
-        dataset = dataset.filter(
-            self._filter_long_labels, num_proc=num_proc
-        )
-        for split, before_count in before.items():
-            after_count = len(dataset[split])
-            if before_count != after_count:
-                logger.warning(
-                    f"[KoreanDatasetLoader] '{split}' split: "
-                    f"{before_count - after_count}개 샘플이 "
-                    f"max_label_length({self.config.max_label_length}) 초과로 제거됨"
-                )
+        for spec in self.config.datasets:
+            logger.info(f"[KoreanDatasetLoader] 데이터셋 로드: {spec.name}")
+            dataset = self._load_single(spec)
 
+            # 오디오 자동 리샘플링 (16kHz)
+            dataset = dataset.cast_column(
+                spec.audio_column, Audio(sampling_rate=self.SAMPLE_RATE)
+            )
+
+            # 컬럼명 정규화: 데이터셋마다 다른 audio/text 컬럼을 표준 이름으로 통일
+            dataset = self._normalize_columns(dataset, spec)
+
+            # 특징 추출 + 토크나이징
+            # fn_kwargs에 model_name을 포함 → 캐시 해시에 모델명이 반영되어
+            # 모델이 달라지면 별도 캐시로 저장됨
+            logger.info(f"[KoreanDatasetLoader] {spec.name}: 특징 추출 및 토크나이징 중...")
+            dataset = dataset.map(
+                self._prepare_dataset,
+                remove_columns=dataset.column_names["train"],
+                num_proc=num_proc,
+                desc=f"Preprocessing {spec.name}",
+                fn_kwargs={"model_name": self.config.model_name},
+            )
+
+            # 너무 긴 레이블 필터링
+            before = {k: len(v) for k, v in dataset.items()}
+            dataset = dataset.filter(self._filter_long_labels, num_proc=num_proc)
+            for split, before_count in before.items():
+                after_count = len(dataset[split])
+                if before_count != after_count:
+                    logger.warning(
+                        f"[KoreanDatasetLoader] '{spec.name}' '{split}' split: "
+                        f"{before_count - after_count}개 샘플이 "
+                        f"max_label_length({self.config.max_label_length}) 초과로 제거됨"
+                    )
+
+            logger.info(
+                f"[KoreanDatasetLoader] {spec.name} 완료 — "
+                f"train: {len(dataset['train'])}개, test: {len(dataset['test'])}개"
+            )
+            all_train.append(dataset["train"])
+            all_test.append(dataset["test"])
+
+        merged = DatasetDict({
+            "train": concatenate_datasets(all_train),
+            "test":  concatenate_datasets(all_test),
+        })
         logger.info(
-            f"[KoreanDatasetLoader] 완료 — "
-            f"train: {len(dataset['train'])}개, "
-            f"test: {len(dataset['test'])}개"
+            f"[KoreanDatasetLoader] 전체 병합 완료 — "
+            f"train: {len(merged['train'])}개, test: {len(merged['test'])}개"
         )
-        return dataset
+        return merged
 
-    def _load_raw(self) -> DatasetDict:
-        """HuggingFace Hub 또는 로컬 디렉터리에서 원시 데이터셋 로드."""
-        is_local = os.path.isdir(self.config.dataset_name)
+    def _load_single(self, spec: DatasetSpec) -> DatasetDict:
+        """HuggingFace Hub 또는 로컬 audiofolder에서 단일 데이터셋 로드."""
+        is_local = os.path.isdir(spec.name)
 
         if is_local:
-            # 로컬 KsponSpeech 등: audiofolder 형식 가정
-            raw = load_dataset(
-                "audiofolder",
-                data_dir=self.config.dataset_name,
-            )
+            raw = load_dataset("audiofolder", data_dir=spec.name)
         else:
-            raw = load_dataset(
-                self.config.dataset_name,
-                self.config.dataset_config,
-                split={
-                    "train": self.config.dataset_split_train,
-                    "test": self.config.dataset_split_test,
-                },
-            )
+            split_map = {"train": spec.split_train, "test": spec.split_test}
+            if spec.config:
+                raw = load_dataset(spec.name, spec.config, split=split_map)
+            else:
+                raw = load_dataset(spec.name, split=split_map)
 
-        # Common Voice에 있는 불필요한 컬럼 제거 (메모리 절약)
-        _drop_cols = [
-            "accent", "age", "client_id", "down_votes", "gender",
-            "locale", "path", "segment", "up_votes", "variant",
-        ]
+        # 불필요한 메타데이터 컬럼 제거 (메모리 절약)
         for split in raw:
-            existing = [c for c in _drop_cols if c in raw[split].column_names]
-            if existing:
-                raw[split] = raw[split].remove_columns(existing)
+            drop = [c for c in self._DROP_COLS if c in raw[split].column_names]
+            if drop:
+                raw[split] = raw[split].remove_columns(drop)
 
         return raw
 
-    def _prepare_dataset(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_columns(
+        self, dataset: DatasetDict, spec: DatasetSpec
+    ) -> DatasetDict:
         """
-        단일 샘플 전처리 (dataset.map()에 전달).
-        Single-sample preprocessing passed to dataset.map().
+        오디오/텍스트 컬럼을 표준 이름(audio, text)으로 정규화.
+        Normalizes audio and text column names to standard names.
+        """
+        rename_map: Dict[str, str] = {}
+        if spec.audio_column != "audio":
+            rename_map[spec.audio_column] = "audio"
+        if spec.text_column != "text":
+            rename_map[spec.text_column] = "text"
 
-        - 오디오 배열 → log-mel spectrogram (80, 3000) — input_features
-        - 텍스트 → 토큰 ID 리스트 — labels
+        if rename_map:
+            dataset = dataset.rename_columns(rename_map)
+
+        # 표준 컬럼(audio, text) 외 나머지 제거
+        keep = {"audio", "text"}
+        for split in dataset:
+            drop = [c for c in dataset[split].column_names if c not in keep]
+            if drop:
+                dataset[split] = dataset[split].remove_columns(drop)
+
+        return dataset
+
+    def _prepare_dataset(
+        self, batch: Dict[str, Any], model_name: str = ""
+    ) -> Dict[str, Any]:
         """
-        audio = batch[self.config.audio_column]
+        정규화된 'audio', 'text' 컬럼으로 특징 추출 및 토크나이징.
+        Feature extraction and tokenization using normalized column names.
+
+        - audio → log-mel spectrogram (80, 3000) — input_features
+        - text  → 토큰 ID 리스트 — labels
+
+        model_name: 캐시 해시 구분용 (fn_kwargs로 전달, 로직에는 미사용)
+        """
+        audio = batch["audio"]
 
         batch["input_features"] = self.processor.feature_extractor(
             audio["array"],
             sampling_rate=audio["sampling_rate"],
         ).input_features[0]
 
-        batch["labels"] = self.processor.tokenizer(
-            batch[self.config.text_column]
-        ).input_ids
+        batch["labels"] = self.processor.tokenizer(batch["text"]).input_ids
 
         return batch
 
@@ -451,8 +534,13 @@ class WhisperFinetuner:
 
     def _build_training_args(self) -> Seq2SeqTrainingArguments:
         """Seq2SeqTrainingArguments 생성."""
+        # Windows에서 fork 기반 dataloader는 deadlock 위험 → num_workers=0
+        num_workers = 0 if sys.platform == "win32" else 4
+
         return Seq2SeqTrainingArguments(
             output_dir=self.config.output_dir,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},  # 최신 PyTorch 호환
             num_train_epochs=self.config.num_train_epochs,
             per_device_train_batch_size=self.config.per_device_train_batch_size,
             per_device_eval_batch_size=self.config.per_device_eval_batch_size,
@@ -460,7 +548,7 @@ class WhisperFinetuner:
             learning_rate=self.config.learning_rate,
             warmup_steps=self.config.warmup_steps,
             max_steps=self.config.max_steps,
-            fp16=self.config.fp16,
+            bf16=self.config.bf16,
             predict_with_generate=self.config.predict_with_generate,
             generation_max_length=self.config.generation_max_length,
             save_steps=self.config.save_steps,
@@ -473,6 +561,8 @@ class WhisperFinetuner:
             push_to_hub=self.config.push_to_hub,
             eval_strategy="steps",
             save_strategy="steps",
+            dataloader_num_workers=num_workers,
+            dataloader_pin_memory=torch.cuda.is_available(),  # GPU 사용 시 전송 속도 향상
             report_to="none",       # wandb / tensorboard 사용 시 변경
         )
 
@@ -598,9 +688,9 @@ if __name__ == "__main__":
         help="Whisper 모델 크기 (tiny/base/small/medium/large-v3)",
     )
     parser.add_argument(
-        "--dataset", default="common_voice",
-        choices=["common_voice", "ksponspeech"],
-        help="학습 데이터셋 선택",
+        "--dataset", default=None,
+        choices=["ksponspeech"],
+        help="로컬 데이터셋 선택 (생략 시 .env의 FT_DATASET_NAMES 사용)",
     )
     parser.add_argument(
         "--dataset-path", default=None,
@@ -637,8 +727,8 @@ if __name__ == "__main__":
     if args.dataset == "ksponspeech":
         if args.dataset_path is None:
             parser.error("--dataset ksponspeech 는 --dataset-path 가 필요합니다.")
-        config.dataset_name = args.dataset_path
-        config.dataset_config = ""
+        # 로컬 단일 데이터셋 지정 시 env var 설정을 덮어씀
+        config.datasets = [DatasetSpec(name=args.dataset_path)]
 
     # ── 파이프라인 실행 ──────────────────────────────────────────────────────
 
