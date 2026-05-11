@@ -1,1 +1,18 @@
+# 가상환경
+.venv/
+env/
+venv/
+
+# 환경변수 (API Key)
 .env
+
+# 파이썬 캐시
+__pycache__/
+*.py[cod]
+
+# 벡터 데이터베이스
+chroma_db/
+data/chroma_db/
+
+# 기타 설정
+.DS_Store
