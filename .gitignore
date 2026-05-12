@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 CLAUDE.md
 
 # 민감 정보 (API 키 등) — 로컬 전용
@@ -59,3 +60,11 @@ logs/
 #모델 무시
 checkpoints/
 faster-whisper-finetuned/
+
+
+# 벡터 데이터베이스
+chroma_db/
+data/chroma_db/
+
+# 기타 설정
+.DS_Store

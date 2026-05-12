@@ -25,12 +25,16 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
         """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
         print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
 
-        # TODO: LLM 처리 추가 시 아래 주석 해제 후 response를 tts.synthesize에 전달
-        # from pipeline.llm import LLMCore
-        # response: str = llm.generate(result["text"])
+        # TODO: LLM 처리 연결 시 아래 주석 해제
+        # from pipeline.llm.chain.graph import app as llm_app
+        # from pipeline.llm.chain.state import AgentState
+        # from langchain_core.messages import HumanMessage
+        # llm_state = AgentState(messages=[HumanMessage(content=result["text"])], ...)
+        # llm_result = llm_app.invoke(llm_state)
+        # response = llm_result["messages"][-1].content
         # tts.synthesize(response)
 
-        tts.synthesize(result["text"])  # 현재: STT → TTS 직결 (LLM 미구현)
+        tts.synthesize(result["text"])  # 현재: STT → TTS 직결 (LLM 미연결)
 
     return on_transcription
 

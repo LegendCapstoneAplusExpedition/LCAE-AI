@@ -1,9 +1,17 @@
 """
-LLM (Large Language Model) pipeline — 추후 구현 예정
+LLM (LangGraph) pipeline — AI MC 브릿지 멘트 생성
 
-예상 인터페이스:
-    from pipeline.llm import LLMCore, LLMConfig
+주요 인터페이스:
+    from pipeline.llm import app                  # LangGraph 컴파일된 앱
+    from pipeline.llm.chain.state import AgentState
+    from pipeline.llm.chain.graph import app
 
-    llm = LLMCore(LLMConfig(...))
-    response: str = llm.generate(prompt="안녕하세요")
+데이터 흐름:
+    AgentState → analyzer_node → knowledge_search_node
+               → decision_node → (speak) script_writer_node → AIMessage
+                               → (wait)  END
 """
+
+from pipeline.llm.chain.graph import app
+
+__all__ = ["app"]

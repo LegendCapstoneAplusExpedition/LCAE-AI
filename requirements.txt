@@ -1,24 +1,40 @@
+# ── 공통 ──────────────────────────────────────────────────────────────────────
+numpy>=1.24.4
+python-dotenv>=1.2.2
+pydantic>=2.12.5
+requests>=2.33.1
+
+# ── STT ───────────────────────────────────────────────────────────────────────
 faster-whisper>=1.2.0
 websockets>=12.0
-numpy>=1.24.4
 sounddevice>=0.4.6       # 마이크 테스트(MicrophoneASRTest) / 스피커 테스트(SpeakerTTSTest) 용
-python-dotenv>=1.0.0     # .env 파일 로드
 
-# TTS
+# ── TTS ───────────────────────────────────────────────────────────────────────
 kokoro>=0.9.4
-misaki[ko]   # 한국어 음소 변환기
+misaki[ko]               # 한국어 음소 변환기
 
-# GPU 사용 시 (선택 — STT faster-whisper, TTS Coqui 공통)
-# torch>=2.0.0
-
-# Silero-VAD 사용 시 (선택, 더 정확한 VAD)
+# ── GPU / Torch (STT Silero-VAD · TTS · sentence-transformers 공통) ─────────
 torch>=2.3.1
 torchaudio>=2.3.1
 
-#ASR Finetuning
+# ── ASR Finetuning ────────────────────────────────────────────────────────────
 datasets
 evaluate
 jiwer>=4.0.0
 torchcodec>=0.11.1
 accelerate
 transformers
+
+# ── LLM / LangGraph / RAG ─────────────────────────────────────────────────────
+langchain>=1.2.15
+langchain-openai>=1.1.12
+langchain-community>=0.4.1
+langchain-chroma>=1.1.0
+langgraph>=1.1.6
+chromadb>=1.5.7
+pypdf>=6.9.2             # PDF 문서 로더 (RAG 데이터 수집)
+sentence-transformers>=5.4.0
+
+# ── API 서버 ──────────────────────────────────────────────────────────────────
+fastapi>=0.135.3
+uvicorn>=0.44.0
