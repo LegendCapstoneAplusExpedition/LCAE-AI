@@ -2,10 +2,17 @@
 
 | 항목 | 내용 |
 |---|---|
-| 모듈명 | `ASR Pipeline` (asr_pipeline.py) |
+| 모듈명 | `ASR Pipeline` (pipeline/stt/asr_pipeline.py) |
 | 작성일 | 2026-04-10 |
-| 버전 | v1.0 |
+| 버전 | v2.0 |
 | 작성자 | sucheoli |
+
+### 변경 이력
+
+| 버전 | 날짜 | 변경 내용 |
+|---|---|---|
+| v1.0 | 2026-04-10 | 최초 작성 |
+| v2.0 | 2026-05-12 | 모듈 경로 `asr_pipeline.py` → `pipeline/stt/`, LLM 파이프라인 연동 완료 반영, 4.3 연동 코드 업데이트 |
 
 ---
 
@@ -19,7 +26,7 @@
 
 ### 배경
 
-2026 캡스톤 시스템은 사용자의 음성을 실시간으로 인식하여 LLM이 처리할 수 있는 텍스트로 변환하는 기능을 필요로 한다. 기존 `asr_pipeline.py` 프로토타입을 기반으로, 백엔드 연동 인터페이스와 결과 데이터 구조를 명확히 정의하여 리팩토링한다.
+2026 캡스톤 시스템은 사용자의 음성을 실시간으로 인식하여 LLM이 처리할 수 있는 텍스트로 변환하는 기능을 필요로 한다. 기존 `asr_pipeline.py` 프로토타입을 기반으로, 백엔드 연동 인터페이스와 결과 데이터 구조를 명확히 정의하여 리팩토링하였으며, `pipeline/stt/` 패키지 구조로 재편되었다.
 
 ### 목표
 
@@ -52,11 +59,11 @@
 
 ### Out of Scope
 
-- LLM 처리 및 응답 생성
-- TTS (Text-to-Speech)
+- LLM 처리 및 응답 생성 (LLM_PRD.md 참조)
+- TTS (TTS_PRD.md 참조)
 - 화자 분리 (Speaker Diarization)
 - 프론트엔드 UI
-- 파인튜닝 코드 (별도 스크립트)
+- 파인튜닝 코드 (ASR_Finetuning_PRD.md 참조)
 
 ---
 
@@ -101,18 +108,35 @@ on_transcription: Callable[[TranscriptionResult], None]
 
 ### 4.3 LLM 모듈 연동
 
-LLM 모듈은 `on_transcription` 콜백을 구현하여 `ASRCore` 또는 `RealtimeASRPipeline` 초기화 시 주입한다.
+LLM 모듈(`pipeline/llm/`)이 구현되어 있다. `on_transcription` 콜백에서 `AgentState`를 구성하여 LangGraph `app.invoke()`를 호출하고, 생성된 AI MC 멘트를 TTS에 전달한다.
 
 ```python
-def handle_transcription(result: TranscriptionResult) -> None:
-    # LLM 모듈에서 구현
-    text = result["text"]
-    confidence = result["confidence"]
-    # downstream 처리...
+from pipeline.stt import PipelineConfig, TranscriptionResult
+from pipeline.llm.chain.graph import app as llm_app
+from pipeline.llm.chain.state import AgentState
+from pipeline.tts import TTSCore, TTSConfig
+from langchain_core.messages import HumanMessage
+
+tts = TTSCore(TTSConfig(), on_synthesis=on_synthesis)
+
+def on_transcription(result: TranscriptionResult) -> None:
+    # LLM 연결 시 아래 주석 해제
+    # state = AgentState(
+    #     messages=[HumanMessage(content=result["text"])],
+    #     silence_duration=6.0,
+    #     question_queue=[],
+    #     current_topic="",
+    #     retrieved_info=[],
+    #     intent="",
+    # )
+    # llm_result = llm_app.invoke(state)
+    # tts.synthesize(llm_result["messages"][-1].content)
+
+    tts.synthesize(result["text"])  # 현재: STT → TTS 직결 (LLM 미연결)
 
 pipeline = RealtimeASRPipeline(
     config=PipelineConfig(ws_uri="ws://backend:8080/audio"),
-    on_transcription=handle_transcription,
+    on_transcription=on_transcription,
 )
 ```
 
@@ -202,22 +226,25 @@ RealtimeASRPipeline          ← WebSocket 클라이언트
 on_transcription(result) callback
         │
         ▼
-   [LLM Module]
+   [pipeline/llm/ — LangGraph AI MC]
+        │ AIMessage.content (브릿지 멘트)
+        ▼
+   [pipeline/tts/ — Kokoro TTS]
 ```
 
 ### 8.2 클래스 책임
 
-| 클래스 | 책임 | 변경 사항 |
+| 클래스 | 책임 | 비고 |
 |---|---|---|
 | `PipelineConfig` | 중앙 설정 (모델 경로, VAD 임계값, WebSocket URI 등) | `model` 필드: 로컬 경로 허용 |
-| `EnergyVAD` | RMS 에너지 기반 VAD | 변경 없음 |
-| `SileroVAD` | torch 기반 고정밀 VAD (선택) | 변경 없음 |
-| `SpeechBuffer` | 발화 구간 상태 머신 | 변경 없음 |
-| `WhisperTranscriber` | faster-whisper 래퍼, 전사 실행 | **`confidence` 반환 추가** (`avg_logprob` → exp 정규화) |
-| `ASRCore` | VAD + Buffer + Transcriber 오케스트레이션 | **콜백 시그니처 `TranscriptionResult`로 변경** |
-| `RealtimeASRPipeline` | WebSocket 클라이언트, 오디오 수신 | 재연결 로직 강화 |
-| `RealtimeASRServer` | WebSocket 서버 (테스트/독립 실행용) | 유지 |
-| `MicrophoneASRTest` | 마이크 직접 테스트 | 유지 |
+| `EnergyVAD` | RMS 에너지 기반 VAD | 기본값 (torch 불필요) |
+| `SileroVAD` | torch 기반 고정밀 VAD | 선택, torch 가용 시 권장 |
+| `SpeechBuffer` | 발화 구간 상태 머신 | — |
+| `WhisperTranscriber` | faster-whisper 래퍼, 전사 실행 | `confidence` 반환 (`avg_logprob` → exp 정규화) |
+| `ASRCore` | VAD + Buffer + Transcriber 오케스트레이션 | 콜백 시그니처 `TranscriptionResult` |
+| `RealtimeASRPipeline` | WebSocket 클라이언트, 오디오 수신 | 재연결 로직 포함 |
+| `RealtimeASRServer` | WebSocket 서버 (테스트/독립 실행용) | — |
+| `MicrophoneASRTest` | 마이크 직접 테스트 | VAD 피드백(█/·) + 전사 히스토리 출력 |
 
 ### 8.3 동시성 모델
 
@@ -236,7 +263,7 @@ sounddevice callback   → 독립 오디오 스레드 (MicrophoneASRTest 전용)
 
 | 패키지 | 버전 | 용도 |
 |---|---|---|
-| `faster-whisper` | >=1.0.0 | Whisper 추론 엔진 |
+| `faster-whisper` | >=1.2.0 | Whisper 추론 엔진 |
 | `websockets` | >=12.0 | WebSocket 클라이언트/서버 |
 | `numpy` | >=1.24.0 | 오디오 데이터 처리 |
 | `sounddevice` | >=0.4.6 | 마이크 입력 (테스트용) |
@@ -254,7 +281,7 @@ sounddevice callback   → 독립 오디오 스레드 (MicrophoneASRTest 전용)
 
 | 패키지 | 용도 |
 |---|---|
-| `torch` | GPU 가속, SileroVAD |
+| `torch>=2.3.1` | GPU 가속, SileroVAD |
 
 ---
 
@@ -270,6 +297,7 @@ sounddevice callback   → 독립 오디오 스레드 (MicrophoneASRTest 전용)
 
 - WebSocket mock 서버 → `RealtimeASRPipeline` → `ASRCore` → 콜백 텍스트/신뢰도 확인
 - 연결 끊김 시 재연결 로직 동작 확인
+- `on_transcription` 콜백 → `pipeline/llm/ app.invoke()` → LLM 응답 수신 확인
 
 ### 성능 테스트
 
@@ -283,9 +311,32 @@ sounddevice callback   → 독립 오디오 스레드 (MicrophoneASRTest 전용)
 
 ---
 
-## 11. 향후 고려 사항 (Future Considerations)
+## 11. 실행 방법
 
+```bash
+# 마이크 테스트 (기본)
+python main.py --mode mic
+
+# WebSocket 서버 모드
+python main.py --mode server --host 0.0.0.0 --port 8765
+
+# WebSocket 클라이언트 모드
+python main.py --mode client --ws-uri ws://localhost:8080/audio
+
+# Fine-tuned 모델 사용
+python main.py --mode mic --model /path/to/faster-whisper-finetuned
+
+# 사용 가능한 마이크 목록 확인
+python main.py --list-devices
+```
+
+---
+
+## 12. 향후 고려 사항 (Future Considerations)
+
+- **STT → LLM 연결 완성**: `main.py`의 `on_transcription` 콜백에서 `pipeline/llm/` 주석 해제로 전체 파이프라인 완성
 - **SileroVAD 기본 적용**: torch 의존성 해결 시 정확도 향상
 - **화자 분리(Diarization)**: 다화자 환경 지원 필요 시 추가
 - **스트리밍 전사**: 발화 종료 전 부분 결과 반환 (faster-whisper streaming API)
 - **다국어 지원**: `language=None` 자동 감지 모드 활성화
+- **침묵 시간 측정**: `ASRCore`에서 침묵 구간 길이를 `AgentState.silence_duration`에 자동 주입하는 인터페이스 추가 검토
