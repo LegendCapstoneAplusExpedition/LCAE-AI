@@ -25,16 +25,27 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
         """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
         print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
 
-        # TODO: LLM 처리 연결 시 아래 주석 해제
-        # from pipeline.llm.chain.graph import app as llm_app
-        # from pipeline.llm.chain.state import AgentState
-        # from langchain_core.messages import HumanMessage
-        # llm_state = AgentState(messages=[HumanMessage(content=result["text"])], ...)
-        # llm_result = llm_app.invoke(llm_state)
-        # response = llm_result["messages"][-1].content
-        # tts.synthesize(response)
-
-        tts.synthesize(result["text"])  # 현재: STT → TTS 직결 (LLM 미연결)
+        from pipeline.llm.chain.graph import app as llm_app
+        from pipeline.llm.chain.state import AgentState
+        from langchain_core.messages import HumanMessage
+        llm_state = AgentState(
+            messages=[HumanMessage(content=result["text"])],
+            is_speaking=False,
+            silence_duration=result.get("silence_duration", 5.0),
+            question_queue=[],
+            current_topic=None,
+            context_summary="",
+            retrieved_info=[],
+            streaming_stage="Main",
+            intent="",
+        )
+        llm_result = llm_app.invoke(llm_state)
+        last_msg = llm_result["messages"][-1]
+        from langchain_core.messages import AIMessage
+        if isinstance(last_msg, AIMessage):
+            tts.synthesize(last_msg.content)
+        else:
+            print(f"[LLM] 응답 없음 (decision=wait), 발화 생략")
 
     return on_transcription
 
@@ -83,9 +94,7 @@ def main() -> None:
         device=args.device,
     )
     tts_config = TTSConfig(
-        model=args.tts_model,
-        language=args.language,
-        device=args.tts_device,
+        lang_code=args.language,
         ws_uri=args.tts_ws_uri,
     )
 

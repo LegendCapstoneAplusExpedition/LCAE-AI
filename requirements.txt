@@ -10,8 +10,8 @@ websockets>=12.0
 sounddevice>=0.4.6       # 마이크 테스트(MicrophoneASRTest) / 스피커 테스트(SpeakerTTSTest) 용
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-kokoro>=0.9.4
-misaki[ko]               # 한국어 음소 변환기
+gtts>=2.5.0
+pydub>=0.25.1            # MP3 → PCM 변환 (ffmpeg 필요)
 
 # ── GPU / Torch (STT Silero-VAD · TTS · sentence-transformers 공통) ─────────
 torch>=2.3.1

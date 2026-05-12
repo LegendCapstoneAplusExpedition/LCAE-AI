@@ -1,18 +1,19 @@
 """
-Real-time TTS Pipeline using Kokoro-82M
+Real-time TTS Pipeline using gTTS (Google Text-to-Speech)
 
 Architecture:
-  text input → KokoroTTSSynthesizer → SynthesisResult callback
-                                    → WebSocket 전송 (백엔드) / 로컬 스피커 재생 (테스트)
+  text input → GTTSSynthesizer → SynthesisResult callback
+                               → WebSocket 전송 (백엔드) / 로컬 스피커 재생 (테스트)
 
 합성된 음성(PCM bytes + 메타데이터)은 on_synthesis 콜백으로 전달됩니다.
 이후 처리(WebSocket 송신, 저장 등)는 호출자가 담당합니다.
 
-엔진 교체: KokoroTTSSynthesizer 대신 BaseTTSSynthesizer를 구현한 다른 클래스
+엔진 교체: GTTSSynthesizer 대신 BaseTTSSynthesizer를 구현한 다른 클래스
 (예: OpenAITTSSynthesizer, ClovaTTSSynthesizer)를 TTSCore에 주입하면 됩니다.
 """
 
 import asyncio
+import io
 import os
 import threading
 import time
@@ -33,7 +34,7 @@ load_dotenv(".env.local", override=True)  # .env.local (민감 정보, git 커�
 
 class SynthesisResult(TypedDict):
     audio: bytes       # PCM 16-bit mono raw bytes
-    sample_rate: int   # 합성 샘플레이트 (Kokoro 기본: 24000)
+    sample_rate: int   # 합성 샘플레이트 (기본: 24000)
     duration: float    # 합성 음성 길이 (초)
     language: str      # 언어 코드 (예: "ko")
 
@@ -52,16 +53,17 @@ class TTSConfig:
     # WebSocket — 합성 결과를 전송할 백엔드 URI
     ws_uri: str = field(default_factory=lambda: _env("TTS_WS_URI", "ws://localhost:8080/tts"))
 
-    # Kokoro 설정
-    # lang_code: Kokoro 언어 코드 ('k'=한국어, 'a'=미국 영어, 'b'=영국 영어 등)
-    lang_code: str = field(default_factory=lambda: _env("TTS_LANG_CODE", "k"))
-    # voice: Kokoro 음성 ID (한국어 여성: kf_bella/kf_heart, 남성: km_blade/km_echo 등)
-    voice: str = field(default_factory=lambda: _env("TTS_VOICE", "kf_bella"))
-    speed: float = field(default_factory=lambda: float(_env("TTS_SPEED", "1.0")))
-    device: str = field(default_factory=lambda: _env("TTS_DEVICE", "auto"))  # auto / cpu / cuda
+    # gTTS 설정
+    # lang_code: ISO 639-1 언어 코드 ('ko'=한국어, 'en'=영어, 'ja'=일본어 등)
+    lang_code: str = field(default_factory=lambda: _env("TTS_LANG_CODE", "ko"))
+    # tld: Google TTS 서버 도메인 (발음 변형 제어)
+    #   'com' = 기본(미국식), 'co.uk' = 영국식, 'com.au' = 호주식
+    tld: str = field(default_factory=lambda: _env("TTS_TLD", "com"))
+    # slow: True이면 느린 속도로 합성
+    slow: bool = field(default_factory=lambda: _env("TTS_SLOW", "false").lower() == "true")
 
     # 오디오 출력
-    sample_rate: int = field(default_factory=lambda: int(_env("TTS_SAMPLE_RATE", "24000")))  # Kokoro 기본
+    sample_rate: int = field(default_factory=lambda: int(_env("TTS_SAMPLE_RATE", "24000")))
 
 
 # ---------------------------------------------------------------------------
@@ -81,52 +83,65 @@ class BaseTTSSynthesizer:
 
 
 # ---------------------------------------------------------------------------
-# Kokoro TTS 구현체
+# gTTS 구현체
 # ---------------------------------------------------------------------------
 
-class KokoroTTSSynthesizer(BaseTTSSynthesizer):
+class GTTSSynthesizer(BaseTTSSynthesizer):
     """
-    Kokoro-82M 기반 합성기.
+    gTTS (Google Text-to-Speech) 기반 합성기.
 
     필요 패키지:
-        pip install kokoro>=0.9.4
-        pip install misaki[ko]  # 한국어 음소 변환기
+        pip install gtts
+        pip install pydub
 
-    모델은 첫 합성 시 자동으로 HuggingFace에서 다운로드됩니다.
+    pydub의 MP3 디코딩에는 ffmpeg가 필요합니다:
+        Windows: https://ffmpeg.org/download.html → PATH 등록
+        Ubuntu:  sudo apt install ffmpeg
+        macOS:   brew install ffmpeg
+
+    gTTS는 Google TTS API를 사용하므로 인터넷 연결이 필요합니다.
     synthesize()는 thread-safe하지 않으므로 TTSCore가 직렬화(순차 스레드)합니다.
     """
 
     def __init__(self, config: TTSConfig):
         self.config = config
+        try:
+            from gtts import gTTS  # noqa: PLC0415 — 임포트 검증
+            from pydub import AudioSegment  # noqa: PLC0415 — 임포트 검증
+        except ImportError as e:
+            raise ImportError(
+                f"[TTS] 필수 패키지 누락: {e}\n"
+                "  pip install gtts pydub\n"
+                "  (MP3 디코딩을 위해 ffmpeg도 필요합니다)"
+            ) from e
 
-        from kokoro import KPipeline  # noqa: PLC0415
-
-        print(f"[TTS] Kokoro 모델 로딩 | lang_code={config.lang_code} | voice={config.voice}")
-        self._pipeline = KPipeline(lang_code=config.lang_code)
-        print("[TTS] 모델 로딩 완료")
+        print(f"[TTS] gTTS 초기화 | lang={config.lang_code} | tld={config.tld} | slow={config.slow}")
 
     def synthesize(self, text: str) -> SynthesisResult:
         """텍스트 → SynthesisResult (PCM 16-bit bytes + 메타데이터)"""
-        chunks = []
-        for _, _, audio in self._pipeline(
-            text,
-            voice=self.config.voice,
-            speed=self.config.speed,
-            split_pattern=r"\n+",
-        ):
-            # audio: numpy float32 array at config.sample_rate Hz
-            chunks.append(audio)
+        from gtts import gTTS  # noqa: PLC0415
+        from pydub import AudioSegment  # noqa: PLC0415
 
-        wav = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-        pcm_int16 = (wav * 32767).clip(-32768, 32767).astype(np.int16)
-        audio_bytes = pcm_int16.tobytes()
-        duration = len(wav) / self.config.sample_rate
+        # 1. gTTS로 MP3 합성 → BytesIO 버퍼
+        tts = gTTS(text=text, lang=self.config.lang_code, tld=self.config.tld, slow=self.config.slow)
+        mp3_buffer = io.BytesIO()
+        tts.write_to_fp(mp3_buffer)
+        mp3_buffer.seek(0)
+
+        # 2. MP3 → PCM 변환 (pydub)
+        segment = AudioSegment.from_mp3(mp3_buffer)
+        segment = segment.set_frame_rate(self.config.sample_rate)  # 리샘플링
+        segment = segment.set_channels(1)                           # 모노
+        segment = segment.set_sample_width(2)                       # 16-bit
+
+        pcm_bytes = segment.raw_data
+        duration = len(segment) / 1000.0  # ms → 초
 
         return SynthesisResult(
-            audio=audio_bytes,
+            audio=pcm_bytes,
             sample_rate=self.config.sample_rate,
             duration=duration,
-            language="ko",
+            language=self.config.lang_code,
         )
 
 
@@ -163,7 +178,7 @@ class TTSCore:
                 f"[TTS] 합성 완료: {r['duration']:.2f}s | {len(r['audio'])} bytes"
             )
         )
-        self._synthesizer = synthesizer or KokoroTTSSynthesizer(self.config)
+        self._synthesizer = synthesizer or GTTSSynthesizer(self.config)
 
     def synthesize(self, text: str):
         """텍스트 합성 요청. 결과는 on_synthesis 콜백으로 전달됩니다 (별도 스레드)."""
@@ -343,8 +358,8 @@ class SpeakerTTSTest:
             sd.default.device[1] = device
 
         print("\n" + "=" * 60)
-        print("  Real-time Kokoro TTS — 스피커 테스트")
-        print(f"  음성: {self.config.voice} | 속도: {self.config.speed}x | lang: {self.config.lang_code}")
+        print("  Real-time gTTS — 스피커 테스트")
+        print(f"  lang: {self.config.lang_code} | tld: {self.config.tld} | slow: {self.config.slow}")
         print("  텍스트 입력 후 Enter → 합성 후 스피커 재생")
         if self._external_on_synthesis:
             print("  콜백 모드: 합성 결과를 on_synthesis으로 전달")
@@ -388,17 +403,16 @@ class SpeakerTTSTest:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Real-time Kokoro TTS Pipeline")
+    parser = argparse.ArgumentParser(description="Real-time gTTS Pipeline")
     parser.add_argument("--mode", choices=["speaker", "client"], default="speaker",
                         help="speaker: 로컬 스피커 테스트 / client: WebSocket으로 백엔드에 PCM 전송")
     parser.add_argument("--ws-uri", default="ws://localhost:8080/tts")
-    parser.add_argument("--voice", default="kf_bella",
-                        help="Kokoro 음성 ID (예: kf_bella, km_blade)")
-    parser.add_argument("--lang-code", default="k",
-                        help="Kokoro 언어 코드 (k=한국어, a=미국 영어 등)")
-    parser.add_argument("--speed", type=float, default=1.0,
-                        help="합성 속도 배율 (기본: 1.0)")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--lang", default="ko",
+                        help="ISO 언어 코드 (예: ko, en, ja)")
+    parser.add_argument("--tld", default="com",
+                        help="Google TTS 도메인 (com=기본, co.uk=영국식 등)")
+    parser.add_argument("--slow", action="store_true",
+                        help="느린 속도로 합성")
     parser.add_argument("--speaker-device", type=int, default=None,
                         help="스피커 디바이스 ID (--mode speaker 전용, 생략 시 기본 스피커)")
     parser.add_argument("--list-devices", action="store_true",
@@ -411,10 +425,9 @@ if __name__ == "__main__":
 
     config = TTSConfig(
         ws_uri=args.ws_uri,
-        voice=args.voice,
-        lang_code=args.lang_code,
-        speed=args.speed,
-        device=args.device,
+        lang_code=args.lang,
+        tld=args.tld,
+        slow=args.slow,
     )
 
     if args.mode == "speaker":
