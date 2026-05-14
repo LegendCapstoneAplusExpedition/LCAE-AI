@@ -4,17 +4,15 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 # pipeline/llm/utils/llm.py → 4단계 상위가 프로젝트 루트
-env_path = Path(__file__).resolve().parent.parent.parent.parent / '.env'
+env_path = Path(__file__).resolve().parent.parent.parent.parent / '.env.local'
 load_dotenv(dotenv_path=env_path)
 
-# 디버깅
-print(f"--- 환경 변수 로드 체크 ---")
-print(f"1. .env 파일 경로: {env_path}")
-print(f"2. 발견 여부: {env_path.exists()}")
-print(f"3. API 키 확인: {str(os.getenv('OPENAI_API_KEY'))[:10]}...")
+api_key = os.getenv("LLM_API_KEY")
+# LangChain 내부에서 OPENAI_API_KEY를 찾는 모든 곳(embeddings 등)에서 공유되도록 설정
+os.environ["OPENAI_API_KEY"] = api_key or ""
 
 llm = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=os.getenv("LLM_MODEL", "gpt-5.4-mini"),
     temperature=0.7,
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=api_key,
 )

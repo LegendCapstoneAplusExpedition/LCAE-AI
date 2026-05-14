@@ -14,6 +14,7 @@ def analyzer_node(state: AgentState):
         return {"current_topic": "대화 시작 전", "context_summary": "대화 없음"}
 
     last_message = state["messages"][-1].content
+    print(f"[LLM:Analyzer] 입력 메시지: \"{last_message}\"")
 
     # 2. 분석용 프롬프트 구성
     # 지침서와 현재 상황을 LLM에게 전달
@@ -37,6 +38,8 @@ def analyzer_node(state: AgentState):
 
     # 4. 결과 반환 (State 업데이트)
     # 리턴된 딕셔너리의 키 값들이 AgentState의 해당 필드들을 자동으로 갱신
+    print(f"[LLM:Analyzer] 주제={analysis.topic} | 의도={analysis.intent}")
+    print(f"[LLM:Analyzer] 요약: {analysis.summary}")
     return {
         "current_topic": analysis.topic,
         "context_summary": analysis.summary,
@@ -62,8 +65,12 @@ def knowledge_search_node(state: AgentState):
     )
 
     # 2. 유사도 기반 검색 (상위 k개 지문만 가져옴)
+    print(f"[LLM:Search] 검색 주제: \"{topic}\"")
     docs = vector_db.similarity_search(topic, k=2)
     retrieved_docs = [doc.page_content for doc in docs]
+    print(f"[LLM:Search] 검색 결과 {len(retrieved_docs)}건")
+    for i, doc in enumerate(retrieved_docs, 1):
+        print(f"[LLM:Search]   [{i}] {doc[:80]}{'...' if len(doc) > 80 else ''}")
 
     # 3. 상태 업데이트
     return {"retrieved_info": retrieved_docs}
@@ -92,10 +99,9 @@ def decision_node(state: AgentState):
 
     # 3. 결과 반환
     # 이 결과는 LangGraph의 'Conditional Edge'에서 경로를 정하는 기준이 됨
-    if should_intervene:
-        return "speak"
-    else:
-        return "wait"
+    decision = "speak" if should_intervene else "wait"
+    print(f"[LLM:Decision] silence={silence:.1f}s | intent=\"{intent}\" | q_count={q_count} → {decision}")
+    return decision
 
 def script_writer_node(state: AgentState):
     """
@@ -133,7 +139,8 @@ def script_writer_node(state: AgentState):
 
     end_time = time.time()  # 응답 시간 측정 종료
     duration = end_time - start_time  # 응답 시간 계산
-    print(f"⏱Script Writer 노드 응답 시간: {duration:.2f}초")
+    print(f"[LLM:Writer] 응답 시간: {duration:.2f}초")
+    print(f"[LLM:Writer] 출력:\n{response.content}")
 
     # 4. 결과 반환
     # 생성된 멘트를 메시지 리스트에 추가합니다.

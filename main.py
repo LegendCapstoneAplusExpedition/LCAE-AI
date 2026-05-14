@@ -24,6 +24,7 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
     def on_transcription(result: TranscriptionResult) -> None:
         """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
         print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
+        print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
 
         from pipeline.llm.chain.graph import app as llm_app
         from pipeline.llm.chain.state import AgentState
@@ -43,9 +44,11 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
         last_msg = llm_result["messages"][-1]
         from langchain_core.messages import AIMessage
         if isinstance(last_msg, AIMessage):
+            print(f"[LLM] ◀ 최종 출력: \"{last_msg.content}\"")
+            print(f"[TTS] ▶ 합성 요청: \"{last_msg.content[:60]}{'...' if len(last_msg.content) > 60 else ''}\"")
             tts.synthesize(last_msg.content)
         else:
-            print(f"[LLM] 응답 없음 (decision=wait), 발화 생략")
+            print(f"[LLM] ◀ decision=wait → 발화 없음")
 
     return on_transcription
 
