@@ -54,8 +54,19 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
 
 
 def _on_synthesis(result: SynthesisResult) -> None:
-    """TTS 합성 완료 콜백"""
-    print(f"[TTS] 합성 완료: {result['duration']:.2f}s ({len(result['audio'])} bytes)")
+    """TTS 합성 완료 콜백 — 로그 출력 후 스피커로 즉시 재생"""
+    print(f"[TTS] 합성 완료: {result['duration']:.2f}s ({len(result['audio'])} bytes) → 스피커 재생 중...")
+    try:
+        import numpy as np
+        import sounddevice as sd
+        pcm = np.frombuffer(result["audio"], dtype=np.int16).astype(np.float32) / 32767.0
+        sd.play(pcm, samplerate=result["sample_rate"])
+        sd.wait()
+        print("[TTS] 재생 완료")
+    except ImportError:
+        print("[TTS] 경고: sounddevice 미설치 → 재생 생략 (pip install sounddevice)")
+    except Exception as e:
+        print(f"[TTS] 재생 오류: {e}")
 
 
 def main() -> None:
