@@ -355,39 +355,62 @@ class RealtimeASRServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         config: Optional[PipelineConfig] = None,
-        on_transcription: Optional[Callable[[TranscriptionResult], None]] = None,
+        on_transcription: Optional[Callable[[TranscriptionResult, Optional[websockets.WebSocketServerProtocol]], None]] = None,
     ):
         self.host = host
         self.port = port
         self.config = config or PipelineConfig()
         self.on_transcription = on_transcription or (
-            lambda r: print(f"[ASR] {r['text']} (confidence={r['confidence']:.3f})")
+            lambda r, ws: print(f"[ASR] {r['text']} (confidence={r['confidence']:.3f})")
         )
 
     async def _handle_client(self, websocket, path: str = "/"):
-        print(f"[Server] 클라이언트 연결: {websocket.remote_address}")
+        print(f"[Server] 클라이언트 연결됨: {websocket.remote_address}")
 
         loop = asyncio.get_event_loop()
+        
+        # wrap the callback to include the websocket
+        def callback_with_ws(result: TranscriptionResult):
+            if asyncio.iscoroutinefunction(self.on_transcription):
+                asyncio.run_coroutine_threadsafe(self.on_transcription(result, websocket), loop)
+            else:
+                self.on_transcription(result, websocket)
+
         core = ASRCore(
             self.config,
-            on_transcription=self.on_transcription,
+            on_transcription=callback_with_ws,
         )
 
-        async for message in websocket:
-            if isinstance(message, bytes):
-                raw = message
-            else:
-                data = json.loads(message)
-                if data.get("type") == "end":
-                    break
-                import base64
-                raw = base64.b64decode(data["audio"])
+        chunk_count = 0
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    raw = message
+                else:
+                    data = json.loads(message)
+                    if data.get("type") == "end":
+                        break
+                    import base64
+                    raw = base64.b64decode(data["audio"])
 
-            pcm_int16 = np.frombuffer(raw, dtype=np.int16)
-            chunk = pcm_int16.astype(np.float32) / 32768.0
-            await loop.run_in_executor(None, core.push, chunk)
+                # 데이터 수신 시각화 (100청크마다 출력하여 너무 시끄럽지 않게 함)
+                chunk_count += 1
+                if chunk_count % 100 == 0:
+                    print(".", end="", flush=True)
 
-        print(f"[Server] 클라이언트 종료: {websocket.remote_address}")
+                pcm_int16 = np.frombuffer(raw, dtype=np.int16)
+                chunk = pcm_int16.astype(np.float32) / 32768.0
+                
+                # VAD 상태 확인 로그 (옵션: 너무 많으면 삭제 가능)
+                if core.vad.is_speech(chunk):
+                    if not core.buffer._is_speaking:
+                        print("\n[VAD] 음성 감지됨! (Speech Started)", flush=True)
+
+                await loop.run_in_executor(None, core.push, chunk)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
+        print(f"\n[Server] 클라이언트 연결 종료: {websocket.remote_address}")
 
     async def serve(self):
         print(f"[Server] ASR 서버 시작: ws://{self.host}:{self.port}")

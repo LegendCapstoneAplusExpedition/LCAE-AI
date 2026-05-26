@@ -16,13 +16,41 @@ from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
 
 
-def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
+def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, ws_out=None):
     """STT → (LLM) → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
 
-    tts = TTSCore(tts_config, on_synthesis=_on_synthesis)
+    def _send_to_ws(result: SynthesisResult) -> None:
+        """TTS 합성 완료 콜백 — WebSocket으로 전송 (있을 경우)"""
+        if ws_out:
+            print(f"[TTS] 합성 완료: {result['duration']:.2f}s ({len(result['audio'])} bytes) → WebSocket 전송")
+            import asyncio
+            asyncio.run_coroutine_threadsafe(ws_out.send(result['audio']), asyncio.get_event_loop())
+        else:
+            _on_synthesis(result)
 
-    def on_transcription(result: TranscriptionResult) -> None:
+    tts = TTSCore(tts_config, on_synthesis=_send_to_ws)
+
+    def on_transcription(result: TranscriptionResult, websocket=None) -> None:
         """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
+        nonlocal tts
+        if websocket and ws_out is None:
+            # Server mode: Use the connected websocket for output
+            # Capture the current event loop to use for sending
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            def _server_send(res: SynthesisResult) -> None:
+                 print(f"[TTS] 합성 완료: {res['duration']:.2f}s ({len(res['audio'])} bytes) → Client WebSocket 전송")
+                 if websocket.open:
+                     # Use the captured loop or try to get the running one
+                     target_loop = loop or asyncio.get_event_loop()
+                     asyncio.run_coroutine_threadsafe(websocket.send(res['audio']), target_loop)
+            
+            tts.on_synthesis = _server_send
+
         print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
         print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
 
