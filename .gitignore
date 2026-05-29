@@ -68,3 +68,10 @@ data/chroma_db/
 
 # 기타 설정
 .DS_Store
+
+
+# LLM 학습
+merged_model/
+adapters/
+*.safetensors
+*.f16.gguf

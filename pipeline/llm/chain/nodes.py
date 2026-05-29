@@ -3,43 +3,44 @@ from pipeline.llm.utils.llm import llm
 from pipeline.llm.prompts.persona import SYSTEM_PROMPT
 from pipeline.llm.chain.state import AgentState, AnalysisResult
 import time
+import json
 
 def analyzer_node(state: AgentState):
     """
     멘토의 마지막 발화를 분석하여 주제와 요약을 추출하는 노드
     """
 
-    # 1. 최근 메시지 추출 (메시지가 없을 경우를 대비한 예외 처리)
+    # 1. 최근 메시지 추출
     if not state["messages"]:
-        return {"current_topic": "대화 시작 전", "context_summary": "대화 없음"}
+        return {"current_topic": "대화 시작 전", "context_summary": "대화 없음", "intent": "대기"}
 
     last_message = state["messages"][-1].content
     print(f"[LLM:Analyzer] 입력 메시지: \"{last_message}\"")
 
     # 2. 분석용 프롬프트 구성
-    # 지침서와 현재 상황을 LLM에게 전달
     user_prompt = f"""
     아래는 실시간 멘토링 중인 멘토의 발화 내용입니다.
     이를 분석하여 주제(topic), 요약(summary), 발화 의도(intent)를 추출하세요.
+    주제는 단어로 조합된 키워드(명사구 등)로, 요약은 3줄 이내, 발화 의도는 1줄로 정리하세요.
+    각 부분간 "\n"과 같은 개행 문자로 구분하세요.
 
     멘토의 발화:
     "{last_message}"
     """
 
-    # 3. LLM 호출 (지능 주입)
-    # .with_structured_output을 사용하여 AnalysisResult 규격에 맞는 객체를 받음
+    # 3. LLM 호출 (구조화된 출력 강제)
+    # AnalysisResult 클래스가 사전에 정의되어 있어야 함
     structured_llm = llm.with_structured_output(AnalysisResult)
 
-    # 시스템 지침(Persona)과 사용자 요청을 결합하여 전달
     analysis = structured_llm.invoke([
         ("system", SYSTEM_PROMPT),
         ("human", user_prompt)
     ])
 
-    # 4. 결과 반환 (State 업데이트)
-    # 리턴된 딕셔너리의 키 값들이 AgentState의 해당 필드들을 자동으로 갱신
+    # 4. 결과 반환
     print(f"[LLM:Analyzer] 주제={analysis.topic} | 의도={analysis.intent}")
     print(f"[LLM:Analyzer] 요약: {analysis.summary}")
+    
     return {
         "current_topic": analysis.topic,
         "context_summary": analysis.summary,
@@ -149,3 +150,37 @@ def script_writer_node(state: AgentState):
         "messages": [AIMessage(content=response.content)],
         "streaming_stage": "Output_Ready"  # 출력이 준비되었다는 상태 표시
     }
+
+if __name__ == "__main__":
+    from langchain_core.messages import HumanMessage
+    
+    print("[LLM 독립 테스트] nodes.py 단독 실행 검증 시작")
+    
+    # 1. 입력 상태 데이터(State) 정의
+    mock_state = {
+        "messages": [HumanMessage(content="가우시안 스플래팅 렌더링 파이프라인 최적화에 대해 설명 중입니다.")],
+        "silence_duration": 6.5,  # 5초 이상으로 설정하여 개입 유도
+        "question_queue": ["메모리 점유율은 어떻게 줄이나요?"],
+        "current_topic": "",
+        "retrieved_info": [],
+        "intent": ""
+    }
+    
+    # 2. 첫 번째 분석 노드 단독 테스트
+    print("\n--- [1] Analyzer Node 테스트 ---")
+    analyzer_result = analyzer_node(mock_state)
+    print("결과 수신:", analyzer_result)
+    
+    # 분석 노드의 결과값을 기존 상태에 업데이트 (누적 시뮬레이션)
+    mock_state.update(analyzer_result)
+    
+    # 3. 두 번째 검색 노드 단독 테스트
+    print("\n--- [2] Knowledge Search Node 테스트 ---")
+    search_result = knowledge_search_node(mock_state)
+    print("결과 수신:", search_result)
+    mock_state.update(search_result)
+    
+    # 4. 세 번째 판단 노드 단독 테스트
+    print("\n--- [3] Decision Node 판단 테스트 ---")
+    decision_action = decision_node(mock_state)
+    print(f"결과 수신: 최종 경로 분기는 -> [{decision_action}] 입니다.")

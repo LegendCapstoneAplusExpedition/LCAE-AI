@@ -10,20 +10,16 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pydantic>=2.12.5",
     "requests>=2.33.1",
-
     # STT
     "faster-whisper>=1.2.0",
     "websockets>=12.0",
     "sounddevice>=0.4.6",
-
     # TTS
     "kokoro>=0.9.4",
     "misaki[ko]",
-
     # GPU / Torch
     "torch>=2.3.1",
     "torchaudio>=2.3.1",
-
     # ASR Finetuning
     "datasets",
     "evaluate",
@@ -31,7 +27,6 @@ dependencies = [
     "torchcodec>=0.11.1",
     "accelerate",
     "transformers",
-
     # LLM / LangGraph / RAG
     "langchain>=1.2.15",
     "langchain-openai>=1.1.12",
@@ -41,8 +36,10 @@ dependencies = [
     "chromadb>=1.5.7",
     "pypdf>=6.9.2",
     "sentence-transformers>=5.4.0",
-
     # API 서버
     "fastapi>=0.135.3",
     "uvicorn>=0.44.0",
+    "langchain-ollama>=1.1.0",
+    "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
 ]

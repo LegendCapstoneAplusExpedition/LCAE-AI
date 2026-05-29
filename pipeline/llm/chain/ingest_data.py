@@ -9,7 +9,7 @@ def ingest_text_documents():
     data_path = "./data"
     if not os.path.exists(data_path):
         os.makedirs(data_path)
-        print(f"{data_path} 폴더가 없어 생성했습니다. 여기에 .txt 파일을 넣어주세요.")
+        print(f"{data_path} 폴더 생성 완료(.txt 파일 위치")
         return
 
     print("데이터 로딩 중...")
