@@ -14,23 +14,42 @@ import sys
 
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
+from pipeline.listenlist import ListenList
 
 
 def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
     """STT → (LLM) → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
 
     tts = TTSCore(tts_config, on_synthesis=_on_synthesis)
+    listen_list = ListenList()
 
     def on_transcription(result: TranscriptionResult) -> None:
-        """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
+        """STT 결과 수신 콜백 — ListenList 저장 → LLM → TTS 연결 지점"""
         print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
-        print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
+
+        # 1. ListenList에 저장
+        entry = listen_list.append(result["text"], result["confidence"])
+        all_entries = listen_list.read_all()
+        print(f"[ListenList] 저장 ({entry['time']}, 누적 {len(all_entries)}건)")
+
+        # 2. 최근 발화 이력을 컨텍스트로 구성 (현재 항목 제외, 최대 10건)
+        prior = [e for e in all_entries if e["time"] != entry["time"]][-10:]
 
         from pipeline.llm.chain.graph import app as llm_app
         from pipeline.llm.chain.state import AgentState
         from langchain_core.messages import HumanMessage
+
+        messages = []
+        if prior:
+            history = "\n".join(
+                f"[{e['time']}ms] {e['text']} (신뢰도: {e['conf']:.2f})" for e in prior
+            )
+            messages.append(HumanMessage(content=f"[이전 발화 기록]\n{history}"))
+        messages.append(HumanMessage(content=result["text"]))
+
+        print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
         llm_state = AgentState(
-            messages=[HumanMessage(content=result["text"])],
+            messages=messages,
             is_speaking=False,
             silence_duration=result.get("silence_duration", 5.0),
             question_queue=[],
@@ -41,6 +60,11 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
             intent="",
         )
         llm_result = llm_app.invoke(llm_state)
+
+        # 3. LLM 처리 완료 후 해당 항목 삭제
+        listen_list.remove_entry(entry["time"])
+        print(f"[ListenList] 처리 완료 — {entry['time']} 삭제")
+
         last_msg = llm_result["messages"][-1]
         from langchain_core.messages import AIMessage
         if isinstance(last_msg, AIMessage):
