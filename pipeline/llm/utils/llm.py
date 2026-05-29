@@ -52,10 +52,15 @@ ollama --rm podcast-mc
 
 from langchain_ollama import ChatOllama
 
-llm = ChatOllama(
-    # model = "podcast-mc", # LoRA 초기 모델(8bits)
-    model = "podcast-mc-q4", # 4bits 양자화
-    # model = "llama3.1:8b", # 롤백용
+# 구조화 출력용 (preprocess/analyzer) — JSON 모드 + 낮은 temperature
+llm_structured = ChatOllama(
+    model       = "podcast-mc-q4",
     temperature = 0.1,
-    format = "json"  # 답변 형식
+    format      = "json",
+)
+
+# 자유 텍스트 생성용 (script_writer) — JSON 모드 OFF + 적절한 temperature
+llm = ChatOllama(
+    model       = "podcast-mc-q4",
+    temperature = 0.7,
 )

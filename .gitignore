@@ -77,3 +77,6 @@ adapters/
 *.gguf
 Modelfile
 Modelfile_q4
+
+# 임시
+tests
