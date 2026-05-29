@@ -74,4 +74,6 @@ data/chroma_db/
 merged_model/
 adapters/
 *.safetensors
-*.f16.gguf
+*.gguf
+Modelfile
+Modelfile_q4
