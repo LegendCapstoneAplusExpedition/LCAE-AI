@@ -1,28 +1,80 @@
 from langchain_core.messages import AIMessage
+from langchain_chroma import Chroma
 from pipeline.llm.utils.llm import llm
+from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.prompts.persona import SYSTEM_PROMPT
-from pipeline.llm.chain.state import AgentState, AnalysisResult
+from pipeline.llm.chain.state import AgentState, AnalysisResult, PreprocessResult
 import time
-import json
+
+_vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+
+# 중요도 임계값: 이 값 이상인 구간만 분석에 사용
+IMPORTANCE_THRESHOLD = 0.5
+
+def preprocess_node(state: AgentState):
+    """
+    STT 원문을 의미 단위로 분리하고 중요도를 평가해 핵심 내용만 추출하는 노드.
+    중요도 0.5 미만 구간(필러, 추임새, 말 더듬기 등)은 제거한다.
+    """
+    if not state["messages"]:
+        return {"cleaned_text": ""}
+
+    raw_text = state["messages"][-1].content
+    print(f"[LLM:Preprocess] 원문: \"{raw_text}\"")
+
+    prompt = f"""아래는 실시간 음성 인식(STT)으로 변환된 한국어 발화입니다.
+문장을 의미 단위 구간으로 분리하고, 각 구간의 중요도를 0.0~1.0으로 평가하세요.
+
+중요도 기준:
+- 0.0~0.2: 추임새, 감탄사 (아, 어, 음, 에-)
+- 0.2~0.4: 말 더듬기, 반복 표현
+- 0.4~0.5: 전환 표현 (그니까, 제 말은, 있잖아요 등)
+- 0.5~0.7: 부가 설명, 맥락 연결
+- 0.7~1.0: 핵심 내용, 질문, 주제 정보
+
+발화:
+"{raw_text}"
+"""
+
+    structured_llm = llm.with_structured_output(PreprocessResult)
+    result: PreprocessResult = structured_llm.invoke([
+        ("system", "당신은 한국어 구어체 발화를 분석하는 전문가입니다."),
+        ("human", prompt)
+    ])
+
+    kept = [seg.text for seg in result.segments if seg.importance >= IMPORTANCE_THRESHOLD]
+    cleaned = " ".join(kept).strip()
+
+    print(f"[LLM:Preprocess] 구간 분석:")
+    for seg in result.segments:
+        flag = "✓" if seg.importance >= IMPORTANCE_THRESHOLD else "✗"
+        print(f"  {flag} [{seg.importance:.2f}] \"{seg.text}\"")
+    print(f"[LLM:Preprocess] 정제 결과: \"{cleaned}\"")
+
+    return {"cleaned_text": cleaned}
+
 
 def analyzer_node(state: AgentState):
     """
     멘토의 마지막 발화를 분석하여 주제와 요약을 추출하는 노드
     """
 
-    # 1. 최근 메시지 추출
+    # 1. 최근 메시지 추출 (preprocess_node가 정제한 텍스트 우선 사용)
     if not state["messages"]:
         return {"current_topic": "대화 시작 전", "context_summary": "대화 없음", "intent": "대기"}
 
-    last_message = state["messages"][-1].content
+    cleaned = state.get("cleaned_text", "").strip()
+    last_message = cleaned if cleaned else state["messages"][-1].content
+    prev_summary = state.get("context_summary", "")
     print(f"[LLM:Analyzer] 입력 메시지: \"{last_message}\"")
 
-    # 2. 분석용 프롬프트 구성
+    # 2. 분석용 프롬프트 구성 (이전 요약을 넣어 누적 컨텍스트 유지)
     user_prompt = f"""
     아래는 실시간 멘토링 중인 멘토의 발화 내용입니다.
     이를 분석하여 주제(topic), 요약(summary), 발화 의도(intent)를 추출하세요.
     주제는 단어로 조합된 키워드(명사구 등)로, 요약은 3줄 이내, 발화 의도는 1줄로 정리하세요.
-    각 부분간 "\n"과 같은 개행 문자로 구분하세요.
+
+    {f'[이전까지의 대화 요약]: {prev_summary}' if prev_summary else ''}
 
     멘토의 발화:
     "{last_message}"
@@ -47,9 +99,6 @@ def analyzer_node(state: AgentState):
         "intent": analysis.intent,
     }
 
-from langchain_chroma import Chroma
-from pipeline.llm.utils.embeddings import embeddings
-
 def knowledge_search_node(state: AgentState):
     """
     주제를 바탕으로 Vector DB에서 관련 지식을 검색하는 노드
@@ -59,15 +108,9 @@ def knowledge_search_node(state: AgentState):
     if not topic or topic == "대화 시작 전":
         return {"retrieved_info": ["관련 지식을 찾을 수 없습니다."]}
 
-    # 1. 기존에 생성된 Chroma DB 연결 (경로는 프로젝트에 맞게 수정)
-    vector_db = Chroma(
-        persist_directory="./chroma_db",
-        embedding_function=embeddings
-    )
-
-    # 2. 유사도 기반 검색 (상위 k개 지문만 가져옴)
+    # 유사도 기반 검색 (상위 k개 지문만 가져옴)
     print(f"[LLM:Search] 검색 주제: \"{topic}\"")
-    docs = vector_db.similarity_search(topic, k=2)
+    docs = _vector_db.similarity_search(topic, k=2)
     retrieved_docs = [doc.page_content for doc in docs]
     print(f"[LLM:Search] 검색 결과 {len(retrieved_docs)}건")
     for i, doc in enumerate(retrieved_docs, 1):
@@ -93,7 +136,7 @@ def decision_node(state: AgentState):
 
     if silence >= 5.0:  # 5초 이상 정적
         should_intervene = True
-    elif "question" in intent.lower():  # 멘토가 질문을 던짐
+    elif "질문" in intent:  # 멘토가 질문을 던짐
         should_intervene = True
     elif q_count >= 3:  # 질문이 너무 많이 쌓임
         should_intervene = True
@@ -162,8 +205,10 @@ if __name__ == "__main__":
         "silence_duration": 6.5,  # 5초 이상으로 설정하여 개입 유도
         "question_queue": ["메모리 점유율은 어떻게 줄이나요?"],
         "current_topic": "",
+        "context_summary": "",
         "retrieved_info": [],
-        "intent": ""
+        "intent": "",
+        "cleaned_text": "",
     }
     
     # 2. 첫 번째 분석 노드 단독 테스트

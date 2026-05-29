@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from pipeline.llm.chain.state import AgentState
 from pipeline.llm.chain.nodes import (
+    preprocess_node,
     analyzer_node,
     knowledge_search_node,
     decision_node,
@@ -11,12 +12,14 @@ from pipeline.llm.chain.nodes import (
 workflow = StateGraph(AgentState)
 
 # 노드 등록
+workflow.add_node("preprocess", preprocess_node)
 workflow.add_node("analyzer", analyzer_node)
 workflow.add_node("search", knowledge_search_node)
 workflow.add_node("writer", script_writer_node)
 
 # 고정 엣지 연결 (Fixed Edges)
-workflow.add_edge(START, "analyzer")
+workflow.add_edge(START, "preprocess")
+workflow.add_edge("preprocess", "analyzer")
 workflow.add_edge("analyzer", "search")
 
 # 조건부 엣지 설정 (Conditional Edges)

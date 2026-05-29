@@ -32,8 +32,9 @@ langchain-community>=0.4.1
 langchain-chroma>=1.1.0
 langgraph>=1.1.6
 chromadb>=1.5.7
-pypdf>=6.9.2             # PDF 문서 로더 (RAG 데이터 수집)
+pypdf>=6.9.2
 sentence-transformers>=5.4.0
+langchain-ollama>=0.1.0
 
 # ── API 서버 ──────────────────────────────────────────────────────────────────
 fastapi>=0.135.3

@@ -2,7 +2,6 @@ from typing import Annotated, TypedDict, List, Dict, Optional
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from langgraph.graph import StateGraph, START, END
 
 # State(추후 필요 시 다중 스키마 구현)
 class AgentState(TypedDict):
@@ -27,8 +26,20 @@ class AgentState(TypedDict):
     # 분석 결과
     intent: str          # 멘토 발화 의도 (분석 노드에서 추출)
 
+    # 전처리 결과
+    cleaned_text: str    # 중요도 필터링 후 핵심 내용만 남긴 텍스트
 
-# LLM의 구조화된 출력을 위한 스키마 (추가할 부분)
+
+# 전처리용 구조화 출력 스키마
+class TextSegment(BaseModel):
+    text: str = Field(description="분리된 텍스트 구간")
+    importance: float = Field(description="중요도 점수 (0.0~1.0, 높을수록 핵심 내용)")
+
+class PreprocessResult(BaseModel):
+    segments: List[TextSegment] = Field(description="문장을 의미 단위로 분리한 구간 목록")
+
+
+# LLM의 구조화된 출력을 위한 스키마
 class AnalysisResult(BaseModel):
     topic: str = Field(description="현재 대화의 핵심 키워드나 주제")
     summary: str = Field(description="현재까지의 대화 내용을 한 줄로 요약")
