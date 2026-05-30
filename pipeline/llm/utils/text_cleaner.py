@@ -8,12 +8,12 @@ LLM 전처리 대비 속도: ~0ms vs ~12s
 
 import re
 
-# 문장 첫머리 단독 추임새: "아 ", "어어 ", "음 " 등
+# 문장 첫머리 단독 추임새
 _LEADING_INTERJECTION = re.compile(
     r'^(?:아+|어+|음+|으+|에+|예+)\s+'
 )
 
-# 구어체 전환·메타 표현 (어느 위치든)
+# 구어체 전환·메타 표현
 _FILLER_PHRASES = re.compile(
     r'(?:'
     r'그니까|그러니까'         # 그니까 / 그러니까

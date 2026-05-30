@@ -27,20 +27,15 @@ class AgentState(TypedDict):
     intent: str          # 멘토 발화 의도 (분석 노드에서 추출)
 
     # 전처리 결과
-    cleaned_text: str    # 중요도 필터링 후 핵심 내용만 남긴 텍스트
+    cleaned_text: str    # 필러 제거 후 텍스트
+
+    # 분석+작성 통합 결과
+    mc_script: str       # analyze_write_node가 생성한 MC 멘트 (output_node에서 messages로 이동)
 
 
-# 전처리용 구조화 출력 스키마
-class TextSegment(BaseModel):
-    text: str = Field(description="분리된 텍스트 구간")
-    importance: float = Field(description="중요도 점수 (0.0~1.0, 높을수록 핵심 내용)")
-
-class PreprocessResult(BaseModel):
-    segments: List[TextSegment] = Field(description="문장을 의미 단위로 분리한 구간 목록")
-
-
-# LLM의 구조화된 출력을 위한 스키마
-class AnalysisResult(BaseModel):
-    topic: str = Field(description="현재 대화의 핵심 키워드나 주제")
-    summary: str = Field(description="현재까지의 대화 내용을 한 줄로 요약")
-    intent: str = Field(description="멘토의 발화 의도 (설명, 질문, 인사 등)")
+# 분석+작성 통합 구조화 출력 스키마 (LLM 1회 호출로 분석과 멘트 생성을 동시에 처리)
+class AnalyzeAndWriteResult(BaseModel):
+    topic: str      = Field(description="현재 대화의 핵심 키워드나 주제 (명사구)")
+    summary: str    = Field(description="이전 요약에 이번 발화를 더한 누적 요약 (3줄 이내)")
+    intent: str     = Field(description="발화 의도: 설명/질문/질문요청/정리요청/마무리/대기 중 하나")
+    mc_script: str  = Field(description="상황에 맞는 AI MC 멘트. 개입 불필요 시 빈 문자열")

@@ -40,6 +40,7 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
             streaming_stage="Main",
             intent="",
             cleaned_text="",
+            mc_script="",
         )
         llm_result = llm_app.invoke(llm_state)
         last_msg = llm_result["messages"][-1]
