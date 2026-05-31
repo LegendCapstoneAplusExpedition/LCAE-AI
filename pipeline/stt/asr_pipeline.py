@@ -22,8 +22,10 @@ import websockets
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 
-load_dotenv()             # .env (공통 설정, git 커밋 O)
-load_dotenv(".env.local", override=True)  # .env.local (민감 정보, git 커밋 X)
+load_dotenv()
+
+def _env(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
 
 # ---------------------------------------------------------------------------
 # 결과 타입
@@ -33,15 +35,6 @@ class TranscriptionResult(TypedDict):
     text: str           # 전사된 텍스트
     confidence: float   # 세그먼트 평균 log-prob → exp 정규화 [0, 1]
     language: str       # 감지/설정된 언어 코드 (예: "ko")
-
-
-# ---------------------------------------------------------------------------
-# 설정
-# ---------------------------------------------------------------------------
-
-def _env(key: str, default: str) -> str:
-    """환경변수 값을 반환. 없으면 default."""
-    return os.environ.get(key, default)
 
 
 @dataclass

@@ -9,7 +9,23 @@ STT → LLM → TTS 순서로 연결되는 파이프라인입니다.
     python main.py --mode client --ws-uri ws://localhost:8080/audio
 """
 
+import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
+
+
+def _clear_session_files() -> None:
+    for fname in ("transcriptions.jsonl", "summary.jsonl"):
+        fpath = _LISTENLIST_DIR / fname
+        if fpath.exists():
+            fpath.write_text("", encoding="utf-8")
+            print(f"[시작] {fname} 초기화 완료")
 
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
@@ -55,10 +71,6 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
         llm_result = llm_app.invoke(state)
         state.update(llm_result)
 
-        # 4. LLM 처리 완료 후 해당 항목 삭제
-        listen_list.remove_entry(entry["time"])
-        print(f"[ListenList] 처리 완료 — {entry['time']} 삭제")
-
         msgs = state.get("messages", [])
         last_msg = msgs[-1] if msgs else None
         if isinstance(last_msg, AIMessage):
@@ -89,18 +101,20 @@ def _on_synthesis(result: SynthesisResult) -> None:
 def main() -> None:
     import argparse
 
+    _clear_session_files()
+
     parser = argparse.ArgumentParser(description="Capstone2026-1 통합 파이프라인")
     parser.add_argument("--mode", choices=["mic", "server", "client"], default="mic",
                         help="mic: 마이크 테스트 / server: WebSocket 서버 / client: WebSocket 클라이언트")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--ws-uri", default="ws://localhost:8080/audio")
+    parser.add_argument("--host", default=os.getenv("WS_SERVER_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("WS_SERVER_PORT", "8765")))
+    parser.add_argument("--ws-uri", default=os.getenv("WS_URI", "ws://localhost:8080/audio"))
 
     # STT 설정
-    parser.add_argument("--model", default="base",
+    parser.add_argument("--model", default=os.getenv("ASR_MODEL", "base"),
                         help="Whisper 모델명 (tiny/base/small/medium/large-v3) 또는 로컬 경로")
-    parser.add_argument("--language", default="ko")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--language", default=os.getenv("ASR_LANGUAGE", "ko"))
+    parser.add_argument("--device", default=os.getenv("ASR_DEVICE", "auto"), choices=["auto", "cpu", "cuda"])
     parser.add_argument("--mic-device", type=int, default=None,
                         help="마이크 디바이스 ID (--mode mic 전용, 생략 시 기본 마이크)")
     parser.add_argument("--list-devices", action="store_true",
@@ -139,7 +153,8 @@ def main() -> None:
         import asyncio
         from pipeline.stt import RealtimeASRServer
         server = RealtimeASRServer(host=args.host, port=args.port,
-                                   config=stt_config, on_transcription=on_transcription)
+                                   config=stt_config,
+                                   on_transcription=lambda r, _: on_transcription(r))
         asyncio.run(server.serve())
 
     elif args.mode == "client":
