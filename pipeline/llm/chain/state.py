@@ -34,6 +34,11 @@ class AgentState(TypedDict):
     # ListenList 요약 기록 (summary.jsonl)
     listen_summaries: List[dict]
 
+    # QnA 흐름 제어
+    pending_question: str       # 답변 대기 중인 질문 (없으면 "")
+    needs_web_search: bool      # assess_search_node가 설정하는 웹 검색 필요 여부
+    web_search_results: List[str]  # Tavily 검색 결과
+
 
 # 분석+작성 통합 구조화 출력 스키마 (LLM 1회 호출로 분석과 멘트 생성을 동시에 처리)
 class AnalyzeAndWriteResult(BaseModel):

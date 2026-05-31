@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 
 load_dotenv()
+load_dotenv(".env.local", override=True)
 
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)

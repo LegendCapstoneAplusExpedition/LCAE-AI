@@ -5,6 +5,7 @@ from pipeline.llm.chain.state import AgentState
 
 # 1. 환경 변수 로드
 load_dotenv()
+load_dotenv(".env.local", override=True)
 
 def test_rag_retrieval():
     print("=== Knowledge Search (RAG) 노드 테스트 시작 ===")

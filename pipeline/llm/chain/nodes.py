@@ -139,18 +139,220 @@ def analyze_write_node(state: AgentState):
 # decision_node  (즉시, 규칙 기반 라우팅 함수)
 # ──────────────────────────────────────────────
 def decision_node(state: AgentState) -> str:
-    intent = state.get("intent", "")
-    stage  = state.get("streaming_stage", "Main")
+    intent  = state.get("intent", "")
+    stage   = state.get("streaming_stage", "Main")
+    pending = state.get("pending_question", "")
 
-    # Outro 진입 후에는 마무리도 한 번만 — 이미 Outro면 추가 발화 차단
     if stage == "Outro" and intent == "마무리":
         print(f"[Decision] Outro 진입 완료 → 추가 클로징 차단")
         return "wait"
 
-    should_speak = intent in ("질문요청", "정리요청", "마무리")
+    if intent == "정리요청":
+        print(f"[Decision] intent=\"{intent}\" → summarize")
+        return "summarize"
+
+    if intent == "질문요청":
+        print(f"[Decision] intent=\"{intent}\" → ask_question")
+        return "ask_question"
+
+    if pending and stage == "QnA" and intent not in ("대기", "마무리"):
+        print(f"[Decision] 대기 질문 있음 + QnA 스테이지 → answer_question")
+        return "answer_question"
+
+    should_speak = intent == "마무리"
     decision = "speak" if should_speak else "wait"
     print(f"[Decision] intent=\"{intent}\" → {decision}")
     return decision
+
+
+# ──────────────────────────────────────────────
+# summarize_listenlist_node  (summary.jsonl 기반 1줄 요약)
+# ──────────────────────────────────────────────
+def summarize_listenlist_node(state: AgentState):
+    import time
+    from pipeline.listenlist.listen_list import ListenList
+    from langchain_core.messages import HumanMessage
+    from pipeline.llm.utils.llm import llm
+
+    t0 = time.time()
+    summaries = ListenList().read_summaries()
+
+    if not summaries:
+        mc_script = "아직 요약할 방송 내용이 없습니다."
+        print("[Summarize] summary.jsonl 비어있음")
+        return {"mc_script": mc_script}
+
+    combined = "\n".join(
+        f"[{s.get('time','')}] 키워드: {', '.join(s.get('keywords',[]))}  내용: {s.get('summary','')}"
+        for s in summaries
+    )
+    prompt = (
+        "다음은 방송에서 나온 주요 내용의 요약 목록입니다.\n\n"
+        f"{combined}\n\n"
+        "전체 내용을 MC가 청취자에게 말하는 자연스러운 한 문장(1줄)으로 압축하세요. "
+        "다른 설명 없이 문장만 출력하세요."
+    )
+
+    result = llm.invoke([HumanMessage(content=prompt)])
+    mc_script = result.content.strip()
+
+    print(f"[Summarize] 완료 ({(time.time()-t0):.2f}s): {mc_script}")
+    return {"mc_script": mc_script}
+
+
+# ──────────────────────────────────────────────
+# generate_question_node  (채팅 DB → summary.jsonl 기반 질문 생성)
+# ──────────────────────────────────────────────
+def generate_question_node(state: AgentState):
+    import time, json
+    from pathlib import Path
+    from pipeline.listenlist.listen_list import ListenList
+    from langchain_core.messages import HumanMessage
+    from pipeline.llm.utils.llm import llm
+
+    t0 = time.time()
+    question = ""
+
+    # 1. 채팅 질문 DB 확인 (chat_questions.jsonl)
+    db_path = Path(__file__).parent.parent.parent / "listenlist" / "chat_questions.jsonl"
+    if db_path.exists():
+        rows = []
+        for line in db_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        if rows:
+            question = rows[0].get("question", "")
+            with open(db_path, "w", encoding="utf-8") as f:
+                for r in rows[1:]:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            print(f"[GenerateQuestion] DB에서 질문 가져옴: {question}")
+
+    # 2. DB에 없으면 summary.jsonl 기반 질문 생성
+    if not question:
+        summaries = ListenList().read_summaries()
+
+        if not summaries:
+            mc_script = "질문거리를 찾지 못했습니다. 청취자분들이 궁금한 점 있으시면 말씀해 주세요."
+            return {"mc_script": mc_script, "pending_question": ""}
+
+        recent = summaries[-3:]
+        combined = "\n".join(
+            f"[{s.get('time','')}] {', '.join(s.get('keywords',[]))}: {s.get('summary','')}"
+            for s in recent
+        )
+        prompt = (
+            "다음은 최근 방송 내용의 요약입니다.\n\n"
+            f"{combined}\n\n"
+            "이 내용을 바탕으로 청취자나 게스트가 흥미를 가질 만한 질문 하나를 생성하세요. "
+            "MC가 직접 묻는 자연스러운 한국어 질문 문장으로 작성하고, 다른 설명 없이 질문만 출력하세요."
+        )
+        result = llm.invoke([HumanMessage(content=prompt)])
+        question = result.content.strip()
+        print(f"[GenerateQuestion] summary 기반 생성 ({(time.time()-t0):.2f}s): {question}")
+
+    return {"mc_script": question, "pending_question": question}
+
+
+# ──────────────────────────────────────────────
+# assess_search_node  (웹 검색 필요 여부 판단)
+# ──────────────────────────────────────────────
+def assess_search_node(state: AgentState):
+    import time
+    from langchain_core.messages import HumanMessage
+    from pipeline.llm.utils.llm import llm_structured
+
+    question = state.get("pending_question", "")
+    context  = state.get("context_summary", "")
+
+    t0 = time.time()
+    prompt = (
+        f"질문: {question}\n"
+        f"방송 주제 요약: {context}\n\n"
+        "이 질문에 답하기 위해 최신 뉴스·통계·현재 상황 등 시간에 민감한 정보가 필요하면 YES, "
+        "LLM 지식만으로 충분하면 NO로만 답하세요."
+    )
+    result = llm_structured.invoke([HumanMessage(content=prompt)])
+    content = (result.content if hasattr(result, "content") else str(result)).strip().upper()
+    needs = "YES" in content
+
+    print(f"[AssessSearch] 웹 검색 필요={needs}  ({(time.time()-t0):.2f}s)")
+    return {"needs_web_search": needs}
+
+
+def decision_search_node(state: AgentState) -> str:
+    """assess_search_node 이후 라우팅 — 검색 필요 여부에 따라 분기."""
+    decision = "search" if state.get("needs_web_search", False) else "direct"
+    print(f"[DecisionSearch] → {decision}")
+    return decision
+
+
+# ──────────────────────────────────────────────
+# tavily_search_node  (Tavily 웹 검색)
+# ──────────────────────────────────────────────
+def tavily_search_node(state: AgentState):
+    import time
+    from langchain_community.tools.tavily_search import TavilySearchResults
+
+    question = state.get("pending_question", "")
+    if not question:
+        return {"web_search_results": []}
+
+    t0 = time.time()
+    try:
+        results = TavilySearchResults(max_results=3).invoke(question)
+        texts = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
+        print(f"[Tavily] {len(texts)}건 검색 완료  ({(time.time()-t0):.2f}s)")
+        return {"web_search_results": texts}
+    except Exception as e:
+        print(f"[Tavily] 검색 실패: {e}")
+        return {"web_search_results": []}
+
+
+# ──────────────────────────────────────────────
+# answer_question_node  (요약 + Tavily 기반 3줄 답변)
+# ──────────────────────────────────────────────
+def answer_question_node(state: AgentState):
+    import time
+    from pipeline.listenlist.listen_list import ListenList
+    from langchain_core.messages import HumanMessage
+    from pipeline.llm.utils.llm import llm
+
+    question     = state.get("pending_question", "")
+    web_results  = state.get("web_search_results", [])
+
+    summaries = ListenList().read_summaries()
+    summary_ctx = "\n".join(
+        f"[{s.get('time','')}] {s.get('summary','')}" for s in summaries
+    ) if summaries else "없음"
+
+    web_section = (
+        "\n\n[최신 검색 결과]:\n" + "\n".join(f"- {r[:300]}" for r in web_results)
+        if web_results else ""
+    )
+
+    t0 = time.time()
+    prompt = (
+        f"질문: {question}\n\n"
+        f"[방송 내용 요약]:\n{summary_ctx}"
+        f"{web_section}\n\n"
+        "위 내용과 LLM 지식을 종합하여 MC가 청취자에게 전달하는 답변을 3줄 이내로 작성하세요. "
+        "자연스러운 한국어로, 핵심만 간결하게 작성하세요."
+    )
+
+    result = llm.invoke([HumanMessage(content=prompt)])
+    mc_script = result.content.strip()
+
+    print(f"[AnswerQuestion] 완료 ({(time.time()-t0):.2f}s): {mc_script[:80]}...")
+    return {
+        "mc_script":          mc_script,
+        "pending_question":   "",
+        "web_search_results": [],
+        "streaming_stage":    "Main",
+    }
 
 
 # ──────────────────────────────────────────────

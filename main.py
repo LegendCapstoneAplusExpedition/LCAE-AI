@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+load_dotenv(".env.local", override=True)
 
 _LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
 
