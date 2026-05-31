@@ -2,7 +2,6 @@
 Capstone2026-1 — 통합 파이프라인 진입점
 
 STT → LLM → TTS 순서로 연결되는 파이프라인입니다.
-현재는 STT → TTS가 구현되어 있으며, LLM은 추후 사이에 추가됩니다.
 
 실행 예시:
     python main.py --mode mic
@@ -16,41 +15,31 @@ from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
 
 
-def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig):
-    """STT → (LLM) → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
+def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None):
+    """STT → LLM → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
+    from pipeline.llm.chain.setup import mentor_setup
+    from pipeline.llm.chain.graph import app as llm_app
+    from langchain_core.messages import HumanMessage, AIMessage
 
     tts = TTSCore(tts_config, on_synthesis=_on_synthesis)
+    # 방송 세션 상태 — 호출 간 누적됨
+    state = mentor_setup(topics or [])
 
     def on_transcription(result: TranscriptionResult) -> None:
         """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
-        print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
-        print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
+        print(f"[STT] {result['text']}  (conf={result['confidence']:.3f})")
 
-        from pipeline.llm.chain.graph import app as llm_app
-        from pipeline.llm.chain.state import AgentState
-        from langchain_core.messages import HumanMessage
-        llm_state = AgentState(
-            messages=[HumanMessage(content=result["text"])],
-            is_speaking=False,
-            silence_duration=result.get("silence_duration", 5.0),
-            question_queue=[],
-            current_topic=None,
-            context_summary="",
-            retrieved_info=[],
-            streaming_stage="Main",
-            intent="",
-            cleaned_text="",
-            mc_script="",
-        )
-        llm_result = llm_app.invoke(llm_state)
-        last_msg = llm_result["messages"][-1]
-        from langchain_core.messages import AIMessage
+        state["messages"] = [HumanMessage(content=result["text"])]
+        llm_result = llm_app.invoke(state)
+        state.update(llm_result)
+
+        msgs = state.get("messages", [])
+        last_msg = msgs[-1] if msgs else None
         if isinstance(last_msg, AIMessage):
-            print(f"[LLM] ◀ 최종 출력: \"{last_msg.content}\"")
-            print(f"[TTS] ▶ 합성 요청: \"{last_msg.content[:60]}{'...' if len(last_msg.content) > 60 else ''}\"")
+            print(f"[LLM] {last_msg.content[:80]}{'...' if len(last_msg.content) > 80 else ''}")
             tts.synthesize(last_msg.content)
         else:
-            print(f"[LLM] ◀ decision=wait → 발화 없음")
+            print("[LLM] decision=wait → 발화 없음")
 
     return on_transcription
 

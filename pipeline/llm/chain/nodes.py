@@ -5,9 +5,13 @@ from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
 from pipeline.llm.prompts.persona import SYSTEM_PROMPT
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
+import re
 import time
 
+_WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
+
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+_db_has_data = _vector_db._collection.count() > 0
 
 
 # ──────────────────────────────────────────────
@@ -33,7 +37,13 @@ def preprocess_node(state: AgentState):
 # ──────────────────────────────────────────────
 def knowledge_search_node(state: AgentState):
     search_text = state.get("cleaned_text", "").strip()
-    if not search_text:
+
+    if not _db_has_data:
+        print("[Search] DB 비어있음 → 스킵")
+        return {"retrieved_info": []}
+
+    if len(search_text.split()) < 5:
+        print(f"[Search] 짧은 발화({len(search_text.split())}단어) → 스킵")
         return {"retrieved_info": []}
 
     t0 = time.time()
@@ -59,28 +69,60 @@ def analyze_write_node(state: AgentState):
     question_queue = state.get("question_queue", [])
     knowledge    = "\n".join(state.get("retrieved_info", []))
 
-    q_list       = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
+    # 유효 글자(한글·영문·숫자) 5자 미만 → 필러/추임새, LLM 스킵
+    if len(_WORD_CHARS.findall(last_message)) < 5:
+        print(f"[AnalyzeWrite] 짧은 발화 → LLM 스킵 (intent=대기)")
+        return {
+            "current_topic":   state.get("current_topic", ""),
+            "context_summary": prev_summary,
+            "intent":          "대기",
+            "streaming_stage": stage,
+            "mc_script":       "",
+        }
+
+    # 프롬프트에 넣는 요약은 최신 3문장으로 제한 (토큰 증가 방지)
+    _sentences = [s.strip() for s in re.split(r'(?<=[.!?。])\s+', prev_summary) if s.strip()]
+    summary_for_prompt = " ".join(_sentences[-3:]) if _sentences else "없음"
+
+    q_list        = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
     knowledge_sec = f"\n[검색된 참고 지식]:\n{knowledge}" if knowledge else ""
 
-    prompt = f"""[단계]: {stage}
-[이전 요약]: {prev_summary if prev_summary else '없음'}
+    prompt = f"""[이전 단계]: {stage}
+[이전 요약]: {summary_for_prompt}
 [대기 질문]: {q_list}{knowledge_sec}
 [멘토 발화]: "{last_message}"
+
+반드시 아래 JSON 형식으로만 출력하세요. 규칙:
+- summary: 이전 요약 + 이번 발화를 합쳐 3문장 이내로 압축 재작성. 이전 요약 문장을 그대로 복사하지 말 것. 메타 발화("정리해줘" 등)는 제외. 반드시 1문장 이상.
+- mc_script: 문자열이어야 함.
+{{"topic": "...", "summary": "...", "intent": "...", "mc_script": "..."}}
 """
 
     t0 = time.time()
-    print(f"[AnalyzeWrite] LLM 호출 시작  (stage={stage})")
+    print(f"[AnalyzeWrite] LLM 호출 시작")
 
     result: AnalyzeAndWriteResult = llm_structured.with_structured_output(
-        AnalyzeAndWriteResult
+        AnalyzeAndWriteResult,
+        method="json_mode",
     ).invoke([
         ("system", SYSTEM_PROMPT),
         ("human", prompt),
     ])
 
     elapsed = time.time() - t0
+
+    # streaming_stage: intent 기반 전환 (LLM 출력 아님)
+    if result.intent == "마무리":
+        new_stage = "Outro"
+    elif result.intent == "질문요청":
+        new_stage = "QnA"
+    elif stage == "QnA" and result.intent not in ("질문요청", "마무리"):
+        new_stage = "Main"
+    else:
+        new_stage = stage
+
     print(f"[AnalyzeWrite] 완료  ({elapsed:.2f}s)")
-    print(f"[AnalyzeWrite] topic={result.topic} | intent={result.intent}")
+    print(f"[AnalyzeWrite] topic={result.topic} | intent={result.intent} | stage={stage}→{new_stage}")
     print(f"[AnalyzeWrite] summary: {result.summary}")
     print(f"[AnalyzeWrite] mc_script: \"{result.mc_script[:80]}{'...' if len(result.mc_script) > 80 else ''}\"")
 
@@ -88,6 +130,7 @@ def analyze_write_node(state: AgentState):
         "current_topic":   result.topic,
         "context_summary": result.summary,
         "intent":          result.intent,
+        "streaming_stage": new_stage,
         "mc_script":       result.mc_script,
     }
 
@@ -96,21 +139,17 @@ def analyze_write_node(state: AgentState):
 # decision_node  (즉시, 규칙 기반 라우팅 함수)
 # ──────────────────────────────────────────────
 def decision_node(state: AgentState) -> str:
-    silence  = state.get("silence_duration", 0)
-    intent   = state.get("intent", "")
-    q_count  = len(state.get("question_queue", []))
+    intent = state.get("intent", "")
+    stage  = state.get("streaming_stage", "Main")
 
-    if silence >= 5.0:
-        should_speak = True
-    elif intent in ("질문", "질문요청", "정리요청", "마무리"):
-        should_speak = True
-    elif q_count >= 3:
-        should_speak = True
-    else:
-        should_speak = False
+    # Outro 진입 후에는 마무리도 한 번만 — 이미 Outro면 추가 발화 차단
+    if stage == "Outro" and intent == "마무리":
+        print(f"[Decision] Outro 진입 완료 → 추가 클로징 차단")
+        return "wait"
 
+    should_speak = intent in ("질문요청", "정리요청", "마무리")
     decision = "speak" if should_speak else "wait"
-    print(f"[Decision] silence={silence:.1f}s | intent=\"{intent}\" | q_count={q_count} → {decision}")
+    print(f"[Decision] intent=\"{intent}\" → {decision}")
     return decision
 
 
@@ -122,41 +161,87 @@ def output_node(state: AgentState):
 
     if not mc_script:
         print("[Output] mc_script 없음 → 발화 생략")
-        return {"streaming_stage": "Output_Ready"}
+        return {}
 
     print(f"[Output] 최종 멘트: \"{mc_script}\"")
     return {
-        "messages":        [AIMessage(content=mc_script)],
-        "streaming_stage": "Output_Ready",
+        "messages": [AIMessage(content=mc_script)],
     }
 
 
 if __name__ == "__main__":
     from langchain_core.messages import HumanMessage
+    from pipeline.llm.chain.setup import mentor_setup
 
-    print("[nodes.py 단독 테스트]")
-    mock_state = {
-        "messages":        [HumanMessage(content="계약서에서 납품 범위를 명확히 해야 나중에 분쟁이 없어요. 질문 받을게요.")],
-        "cleaned_text":    "계약서에서 납품 범위를 명확히 해야 나중에 분쟁이 없어요. 질문 받을게요.",
-        "silence_duration": 6.0,
-        "question_queue":  ["계약서 필수 항목이 뭔가요?"],
-        "current_topic":   "",
-        "context_summary": "프리랜서 전환 전략과 포트폴리오 구성에 대해 논의했다.",
-        "retrieved_info":  [],
-        "intent":          "",
-        "mc_script":       "",
-        "streaming_stage": "Main",
-        "is_speaking":     False,
-    }
+    # 방송 전: 멘토가 주제 키워드 사전 입력
+    BASE = mentor_setup(["주니어-시니어 성장", "번아웃 예방", "MVP 전략", "프리랜서 단가"])
+    print(f"[Setup] broadcast_topics={BASE['broadcast_topics']}")
+    print(f"[Setup] current_topic={BASE['current_topic']} | streaming_stage={BASE['streaming_stage']}")
 
-    print("\n--- [1] preprocess ---")
-    mock_state.update(preprocess_node(mock_state))
+    CASES = [
+        # streaming_stage 없음 — LLM이 발화 맥락만 보고 스스로 판단
+        {
+            "_desc": "케이스1: 짧은 filler (대기 예상)",
+            "messages":        [HumanMessage(content="음... 그러니까 그게 말이죠.")],
+            "silence_duration": 1.0,
+            "question_queue":  [],
+            "current_topic":   "주니어-시니어 성장",
+            "context_summary": "시니어는 기술 스택보다 문제 정의 능력이 중요하다.",
+        },
+        {
+            "_desc": "케이스2: 실질 내용 발화 (브릿지 멘트 예상)",
+            "messages":        [HumanMessage(content="번아웃은 시간 관리 실패가 아니라 의미를 잃었을 때 생겨요. 작은 완성 경험을 쌓는 게 핵심이에요.")],
+            "silence_duration": 3.5,
+            "question_queue":  [],
+            "current_topic":   "번아웃 예방 전략",
+            "context_summary": "하루를 집중 블록과 커뮤니케이션 블록으로 나누는 것이 효과적이다.",
+        },
+        {
+            "_desc": "케이스3: 정리요청 — 누적 요약 읽기 예상",
+            "messages":        [HumanMessage(content="지금까지 내용 정리해주세요.")],
+            "silence_duration": 2.0,
+            "question_queue":  [],
+            "current_topic":   "MVP 최소 기능 정의",
+            "context_summary": "사이드 프로젝트는 고객 인터뷰 5개로 수요 검증 후 시작해야 한다. MVP는 핵심 기능 하나로 빠르게 출시하는 것이 효율적이다.",
+        },
+        {
+            "_desc": "케이스4: 질문요청 — 대기 질문 전달 예상",
+            "messages":        [HumanMessage(content="잠깐 질문 받을게요.")],
+            "silence_duration": 2.0,
+            "question_queue":  ["단가 인상은 언제 하는 게 좋나요?", "포트폴리오에 사이드 프로젝트도 넣어도 되나요?"],
+            "current_topic":   "프리랜서 단가 인상",
+            "context_summary": "단가 인상은 JSS 90% 이상, 리뷰 5개 달성 시점이 적기다.",
+        },
+        {
+            "_desc": "케이스5: 마무리 — 클로징 멘트 예상 + Outro 판단 예상",
+            "messages":        [HumanMessage(content="오늘 방송 여기서 마무리할게요. 감사합니다.")],
+            "silence_duration": 2.0,
+            "question_queue":  [],
+            "current_topic":   "작업 견적 산정",
+            "context_summary": "작업 견적은 실제 시간에 커뮤니케이션·수정·버퍼를 더해 1.5배 곱하는 것이 현실적이다. 단가 인상은 JSS 90% 이상 시점이 적기다.",
+        },
+    ]
 
-    print("\n--- [2] search ---")
-    mock_state.update(knowledge_search_node(mock_state))
+    for case in CASES:
+        desc = case.pop("_desc")
+        print(f"\n{'='*60}")
+        print(f"  {desc}")
+        print('='*60)
+        # BASE(setup 초기값) 위에 케이스별 override 병합
+        state = {**BASE, **case}
+        state["cleaned_text"] = ""
+        state["retrieved_info"] = []
+        state["intent"] = ""
+        state["mc_script"] = ""
 
-    print("\n--- [3] analyze_write ---")
-    mock_state.update(analyze_write_node(mock_state))
+        print("\n--- [1] preprocess ---")
+        state.update(preprocess_node(state))
 
-    print("\n--- [4] decision ---")
-    print("결과:", decision_node(mock_state))
+        print("\n--- [2] search ---")
+        state.update(knowledge_search_node(state))
+
+        print("\n--- [3] analyze_write ---")
+        state.update(analyze_write_node(state))
+
+        print("\n--- [4] decision ---")
+        print("결과:", decision_node(state))

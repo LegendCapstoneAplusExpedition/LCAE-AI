@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 CLAUDE.md
 
 # 민감 정보 (API 키 등) — 로컬 전용
@@ -22,6 +21,7 @@ venv/
 .venv/
 env/
 .env/
+train_env/
 
 # IDE
 .vscode/
@@ -73,10 +73,12 @@ data/chroma_db/
 # LLM 학습
 merged_model/
 adapters/
+adapters_v2/
+adapters_*/
 *.safetensors
 *.gguf
-Modelfile
+*.pth
 Modelfile_q4
 
-# 임시
-tests
+# 테스트
+test_outputs/
