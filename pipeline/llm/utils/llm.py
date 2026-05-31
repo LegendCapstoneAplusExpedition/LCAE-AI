@@ -1,18 +1,39 @@
+'''
+LLM_PROVIDER 환경변수로 백엔드 전환:
+  $env:LLM_PROVIDER="groq"   → Groq API (llama-3.1-8b-instant, ~1~2s)
+  $env:LLM_PROVIDER="ollama" → 로컬 Ollama driving-mentor (기본값)
+
+Groq 사용 시 GROQ_API_KEY 환경변수 필요:
+  $env:GROQ_API_KEY="gsk_..."
+'''
+
 import os
-from pathlib import Path
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 
-# pipeline/llm/utils/llm.py → 4단계 상위가 프로젝트 루트
-env_path = Path(__file__).resolve().parent.parent.parent.parent / '.env.local'
-load_dotenv(dotenv_path=env_path)
+_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
 
-api_key = os.getenv("LLM_API_KEY")
-# LangChain 내부에서 OPENAI_API_KEY를 찾는 모든 곳(embeddings 등)에서 공유되도록 설정
-os.environ["OPENAI_API_KEY"] = api_key or ""
+if _PROVIDER == "groq":
+    from langchain_groq import ChatGroq
 
-llm = ChatOpenAI(
-    model=os.getenv("LLM_MODEL", "gpt-5.4-mini"),
-    temperature=0.7,
-    api_key=api_key,
-)
+    llm_structured = ChatGroq(
+        model       = "llama-3.1-8b-instant",
+        temperature = 0.1,
+    )
+    llm = ChatGroq(
+        model       = "llama-3.1-8b-instant",
+        temperature = 0.7,
+    )
+    print(f"[LLM] provider=Groq  model=llama-3.1-8b-instant")
+
+else:
+    from langchain_ollama import ChatOllama
+
+    llm_structured = ChatOllama(
+        model       = "driving-mentor",
+        temperature = 0.1,
+        format      = "json",
+    )
+    llm = ChatOllama(
+        model       = "driving-mentor",
+        temperature = 0.7,
+    )
+    print(f"[LLM] provider=Ollama  model=driving-mentor")

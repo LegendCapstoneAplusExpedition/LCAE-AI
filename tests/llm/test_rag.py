@@ -13,13 +13,15 @@ def test_rag_retrieval():
     # Analyzer 노드가 "가우시안 스플래팅 렌더링"이라는 주제를 뽑았다고 가정
     mock_state: AgentState = {
         "messages": [],
-        "is_speaking": False,
-        "silence_duration": 0.0,
         "question_queue": [],
-        "current_topic": "가우시안 스플래팅 렌더링 파이프라인",  # 테스트할 검색어
+        "broadcast_topics": [],
+        "current_topic": "가우시안 스플래팅 렌더링 파이프라인",
         "context_summary": "",
         "retrieved_info": [],
-        "streaming_stage": "Main"
+        "streaming_stage": "Main",
+        "intent": "",
+        "cleaned_text": "가우시안 스플래팅 렌더링 파이프라인",
+        "mc_script": "",
     }
 
     # 3. 노드 함수 실행

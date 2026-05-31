@@ -1,0 +1,13 @@
+python-dotenv
+pydantic
+requests
+torch
+torchaudio
+langchain
+langchain-community
+langchain-chroma
+langgraph
+chromadb
+pypdf
+sentence-transformers
+langchain-ollama
