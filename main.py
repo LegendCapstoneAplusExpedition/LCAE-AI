@@ -13,6 +13,7 @@ import sys
 
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
+from pipeline.listenlist import ListenList
 
 
 def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None):
@@ -22,21 +23,46 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
     from langchain_core.messages import HumanMessage, AIMessage
 
     tts = TTSCore(tts_config, on_synthesis=_on_synthesis)
-    # 방송 세션 상태 — 호출 간 누적됨
+    # 방송 세션 상태 — 호출 간 누적됨 (topics 기반으로 초기화)
     state = mentor_setup(topics or [])
+    listen_list = ListenList()
 
     def on_transcription(result: TranscriptionResult) -> None:
-        """STT 결과 수신 콜백 — LLM → TTS 연결 지점"""
-        print(f"[STT] {result['text']}  (conf={result['confidence']:.3f})")
+        """STT 결과 수신 콜백 — ListenList 저장 → LLM → TTS 연결 지점"""
+        print(f"[STT] {result['text']}  (conf={result['confidence']:.3f}, lang={result['language']})")
 
-        state["messages"] = [HumanMessage(content=result["text"])]
+        # 1. ListenList에 저장
+        entry = listen_list.append(result["text"], result["confidence"])
+        all_entries = listen_list.read_all()
+        print(f"[ListenList] 저장 ({entry['time']}, 누적 {len(all_entries)}건)")
+
+        # 2. 최근 발화 이력을 컨텍스트로 구성 (현재 항목 제외, 최대 10건)
+        prior = [e for e in all_entries if e["time"] != entry["time"]][-10:]
+
+        messages = []
+        if prior:
+            history = "\n".join(
+                f"[{e['time']}ms] {e['text']} (신뢰도: {e['conf']:.2f})" for e in prior
+            )
+            messages.append(HumanMessage(content=f"[이전 발화 기록]\n{history}"))
+        messages.append(HumanMessage(content=result["text"]))
+
+        print(f"[LLM] ▶ 입력 전달: \"{result['text']}\"")
+
+        # 3. 누적 state에 이번 messages를 반영하여 LLM 호출
+        state["messages"] = messages
+        state["silence_duration"] = result.get("silence_duration", 5.0)
         llm_result = llm_app.invoke(state)
         state.update(llm_result)
+
+        # 4. LLM 처리 완료 후 해당 항목 삭제
+        listen_list.remove_entry(entry["time"])
+        print(f"[ListenList] 처리 완료 — {entry['time']} 삭제")
 
         msgs = state.get("messages", [])
         last_msg = msgs[-1] if msgs else None
         if isinstance(last_msg, AIMessage):
-            print(f"[LLM] {last_msg.content[:80]}{'...' if len(last_msg.content) > 80 else ''}")
+            print(f"[LLM] ◀ 최종 출력: \"{last_msg.content[:80]}{'...' if len(last_msg.content) > 80 else ''}\"")
             tts.synthesize(last_msg.content)
         else:
             print("[LLM] decision=wait → 발화 없음")
