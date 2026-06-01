@@ -257,14 +257,18 @@ class ASRCore:
         self.config = config
         self.on_transcription = on_transcription
         self.transcriber = WhisperTranscriber(config)
-        self.vad = SileroVAD(sample_rate= config.sample_rate)
+        self.vad = SileroVAD(sample_rate=config.sample_rate, threshold=config.vad_threshold)
         self.buffer = SpeechBuffer(config=config)
 
     def push(self, chunk: np.ndarray):
         """float32 PCM 청크 1개를 입력. 발화 완성 시 콜백 호출 (별도 스레드에서)."""
+        was_speaking = self.buffer._is_speaking
         is_speech = self.vad.is_speech(chunk)
+        if is_speech and not was_speaking:
+            print("\n[VAD] 음성 감지됨! (Speech Started)", flush=True)
         audio = self.buffer.push(chunk, is_speech)
         if audio is not None:
+            print(f"[VAD] 발화 종료 → 전사 시작 ({len(audio) / self.config.sample_rate:.2f}s)", flush=True)
             t = threading.Thread(target=self._transcribe, args=(audio,), daemon=True)
             t.start()
 
@@ -307,6 +311,7 @@ class RealtimeASRPipeline:
     async def run(self):
         core = ASRCore(self.config, self.on_transcription)
         delay = self._RECONNECT_BASE_DELAY
+        frame_bytes = self.config.chunk_samples * np.dtype(np.int16).itemsize
 
         while not self._stop_event.is_set():
             try:
@@ -314,14 +319,20 @@ class RealtimeASRPipeline:
                 async with websockets.connect(self.config.ws_uri) as ws:
                     print("[Pipeline] 연결 완료. 오디오 수신 중...")
                     delay = self._RECONNECT_BASE_DELAY  # 연결 성공 시 딜레이 초기화
+                    pending_raw = bytearray()
                     async for message in ws:
                         if isinstance(message, bytes):
-                            chunk = self._bytes_to_float32(message)
+                            raw = message
                         else:
                             import base64
                             raw = base64.b64decode(json.loads(message)["audio"])
-                            chunk = self._bytes_to_float32(raw)
-                        core.push(chunk)
+
+                        pending_raw.extend(raw)
+                        while len(pending_raw) >= frame_bytes:
+                            frame = bytes(pending_raw[:frame_bytes])
+                            del pending_raw[:frame_bytes]
+                            chunk = self._bytes_to_float32(frame)
+                            core.push(chunk)
             except (websockets.exceptions.ConnectionClosed, OSError) as e:
                 if self._stop_event.is_set():
                     break
@@ -376,6 +387,8 @@ class RealtimeASRServer:
         )
 
         chunk_count = 0
+        pending_raw = bytearray()
+        frame_bytes = self.config.chunk_samples * np.dtype(np.int16).itemsize
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
@@ -392,15 +405,13 @@ class RealtimeASRServer:
                 if chunk_count % 100 == 0:
                     print(".", end="", flush=True)
 
-                pcm_int16 = np.frombuffer(raw, dtype=np.int16)
-                chunk = pcm_int16.astype(np.float32) / 32768.0
-                
-                # VAD 상태 확인 로그 (옵션: 너무 많으면 삭제 가능)
-                if core.vad.is_speech(chunk):
-                    if not core.buffer._is_speaking:
-                        print("\n[VAD] 음성 감지됨! (Speech Started)", flush=True)
-
-                await loop.run_in_executor(None, core.push, chunk)
+                pending_raw.extend(raw)
+                while len(pending_raw) >= frame_bytes:
+                    frame = bytes(pending_raw[:frame_bytes])
+                    del pending_raw[:frame_bytes]
+                    pcm_int16 = np.frombuffer(frame, dtype=np.int16)
+                    chunk = pcm_int16.astype(np.float32) / 32768.0
+                    await loop.run_in_executor(None, core.push, chunk)
         except websockets.exceptions.ConnectionClosed:
             pass
 

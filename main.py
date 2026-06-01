@@ -22,15 +22,15 @@ _LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
 
 
 def _clear_session_files() -> None:
-    for fname in ("transcriptions.jsonl", "summary.jsonl"):
+    _LISTENLIST_DIR.mkdir(parents=True, exist_ok=True)
+    for fname in ("transcriptions.jsonl", "summary.jsonl", "chat.jsonl", "ai_outputs.jsonl"):
         fpath = _LISTENLIST_DIR / fname
-        if fpath.exists():
-            fpath.write_text("", encoding="utf-8")
-            print(f"[시작] {fname} 초기화 완료")
+        fpath.write_text("", encoding="utf-8")
+        print(f"[시작] {fname} 초기화 완료")
 
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
-from pipeline.listenlist import ListenList
+from pipeline.listenlist import AIOutputList, ListenList
 
 
 def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None):
@@ -43,6 +43,8 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
     # 방송 세션 상태 — 호출 간 누적됨 (topics 기반으로 초기화)
     state = mentor_setup(topics or [])
     listen_list = ListenList()
+    ai_outputs = AIOutputList()
+    min_llm_confidence = float(os.getenv("ASR_MIN_LLM_CONFIDENCE", "0.55"))
 
     def on_transcription(result: TranscriptionResult) -> None:
         """STT 결과 수신 콜백 — ListenList 저장 → LLM → TTS 연결 지점"""
@@ -52,6 +54,13 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
         entry = listen_list.append(result["text"], result["confidence"])
         all_entries = listen_list.read_all()
         print(f"[ListenList] 저장 ({entry['time']}, 누적 {len(all_entries)}건)")
+
+        if result["confidence"] < min_llm_confidence:
+            print(
+                f"[LLM] STT 신뢰도 낮음({result['confidence']:.3f} < {min_llm_confidence:.2f}) "
+                "→ LLM 호출 생략"
+            )
+            return
 
         # 2. 최근 발화 이력을 컨텍스트로 구성 (현재 항목 제외, 최대 10건)
         prior = [e for e in all_entries if e["time"] != entry["time"]][-10:]
@@ -76,8 +85,22 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
         last_msg = msgs[-1] if msgs else None
         if isinstance(last_msg, AIMessage):
             print(f"[LLM] ◀ 최종 출력: \"{last_msg.content[:80]}{'...' if len(last_msg.content) > 80 else ''}\"")
+            ai_outputs.append(
+                mentor_text=result["text"],
+                mentor_confidence=result["confidence"],
+                state=state,
+                ai_text=last_msg.content,
+                spoken=True,
+            )
             tts.synthesize(last_msg.content)
         else:
+            ai_outputs.append(
+                mentor_text=result["text"],
+                mentor_confidence=result["confidence"],
+                state=state,
+                ai_text="",
+                spoken=False,
+            )
             print("[LLM] decision=wait → 발화 없음")
 
     return on_transcription

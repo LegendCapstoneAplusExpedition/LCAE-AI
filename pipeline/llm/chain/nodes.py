@@ -204,35 +204,27 @@ def summarize_listenlist_node(state: AgentState):
 # generate_question_node  (채팅 DB → summary.jsonl 기반 질문 생성)
 # ──────────────────────────────────────────────
 def generate_question_node(state: AgentState):
-    import time, json
-    from pathlib import Path
+    import os
+    import time
     from pipeline.listenlist.listen_list import ListenList
+    from pipeline.listenlist.chat_list import ChatList
     from langchain_core.messages import HumanMessage
     from pipeline.llm.utils.llm import llm
 
     t0 = time.time()
     question = ""
+    mc_script = ""
 
-    # 1. 채팅 질문 DB 확인 (chat_questions.jsonl)
-    db_path = Path(__file__).parent.parent.parent / "listenlist" / "chat_questions.jsonl"
-    if db_path.exists():
-        rows = []
-        for line in db_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        if rows:
-            question = rows[0].get("question", "")
-            with open(db_path, "w", encoding="utf-8") as f:
-                for r in rows[1:]:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            print(f"[GenerateQuestion] DB에서 질문 가져옴: {question}")
+    # 1. 실시간 채팅 로그(chat.jsonl)에서 아직 사용하지 않은 질문 확인
+    broadcast_id = os.getenv("BROADCAST_ID", "").strip() or None
+    chat_question = ChatList().pop_next_question(broadcast_id=broadcast_id)
+    if chat_question:
+        question = chat_question.get("message", "").strip()
+        username = chat_question.get("username", "").strip()
+        mc_script = f"{username}님 질문입니다. {question}" if username else question
+        print(f"[GenerateQuestion] 채팅에서 질문 가져옴: {question}")
 
-    # 2. DB에 없으면 summary.jsonl 기반 질문 생성
-    if not question:
+    # 2. 채팅 질문이 없으면 summary.jsonl 기반 질문 생성 if not question:
         summaries = ListenList().read_summaries()
 
         if not summaries:
@@ -252,9 +244,10 @@ def generate_question_node(state: AgentState):
         )
         result = llm.invoke([HumanMessage(content=prompt)])
         question = result.content.strip()
+        mc_script = question
         print(f"[GenerateQuestion] summary 기반 생성 ({(time.time()-t0):.2f}s): {question}")
 
-    return {"mc_script": question, "pending_question": question}
+    return {"mc_script": mc_script, "pending_question": question}
 
 
 # ──────────────────────────────────────────────
