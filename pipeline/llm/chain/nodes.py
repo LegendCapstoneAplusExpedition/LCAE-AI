@@ -141,14 +141,6 @@ def analyze_write_node(state: AgentState):
     print(f"[AnalyzeWrite] summary: {result.summary}")
     print(f"[AnalyzeWrite] mc_script: \"{result.mc_script[:80]}{'...' if len(result.mc_script) > 80 else ''}\"")
 
-    return {
-        "current_topic":   result.topic,
-        "context_summary": result.summary,
-        "intent":          result.intent,
-        "streaming_stage": new_stage,
-        "mc_script":       result.mc_script,
-    }
-
     if result.summary:
         try:
             import json as _json
@@ -176,6 +168,14 @@ def analyze_write_node(state: AgentState):
             _READY_QUESTION_PATH.unlink()
     except Exception:
         pass
+
+    return {
+        "current_topic":   result.topic,
+        "context_summary": result.summary,
+        "intent":          result.intent,
+        "streaming_stage": new_stage,
+        "mc_script":       result.mc_script,
+    }
 
 
 # ──────────────────────────────────────────────
