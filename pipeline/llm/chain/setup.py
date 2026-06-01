@@ -12,7 +12,4 @@ def mentor_setup(topics: list[str]) -> dict:
         "cleaned_text":       "",
         "mc_script":          "",
         "listen_summaries":   [],
-        "pending_question":   "",
-        "needs_web_search":   False,
-        "web_search_results": [],
     }

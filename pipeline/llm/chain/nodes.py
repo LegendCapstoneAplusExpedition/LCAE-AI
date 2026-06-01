@@ -198,10 +198,6 @@ def decision_node(state: AgentState) -> str:
         print(f"[Decision] intent=\"{intent}\" → ask_question")
         return "ask_question"
 
-    if pending and stage == "QnA" and intent not in ("대기", "마무리"):
-        print(f"[Decision] 대기 질문 있음 + QnA 스테이지 → answer_question")
-        return "answer_question"
-
     should_speak = intent == "마무리"
     decision = "speak" if should_speak else "wait"
     print(f"[Decision] intent=\"{intent}\" → {decision}")
@@ -258,102 +254,7 @@ def generate_question_node(state: AgentState):
     mc_script = f"{username}님 질문입니다. {question}" if username else question
 
     print(f"[GenerateQuestion] 질문 가져옴 ({(time.time()-t0)*1000:.1f}ms): {question}")
-    return {"mc_script": mc_script, "pending_question": question}
-
-
-# ──────────────────────────────────────────────
-# assess_search_node  (웹 검색 필요 여부 판단)
-# ──────────────────────────────────────────────
-def assess_search_node(state: AgentState):
-    import time
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.utils.llm import llm_structured
-
-    question = state.get("pending_question", "")
-    context  = state.get("context_summary", "")
-
-    t0 = time.time()
-    prompt = (
-        f"질문: {question}\n"
-        f"방송 주제 요약: {context}\n\n"
-        "이 질문에 답하기 위해 최신 뉴스·통계·현재 상황 등 시간에 민감한 정보가 필요하면 YES, "
-        "LLM 지식만으로 충분하면 NO로만 답하세요."
-    )
-    result = llm_structured.invoke([HumanMessage(content=prompt)])
-    content = (result.content if hasattr(result, "content") else str(result)).strip().upper()
-    needs = "YES" in content
-
-    print(f"[AssessSearch] 웹 검색 필요={needs}  ({(time.time()-t0):.2f}s)")
-    return {"needs_web_search": needs}
-
-
-def decision_search_node(state: AgentState) -> str:
-    """assess_search_node 이후 라우팅 — 검색 필요 여부에 따라 분기."""
-    decision = "search" if state.get("needs_web_search", False) else "direct"
-    print(f"[DecisionSearch] → {decision}")
-    return decision
-
-
-# ──────────────────────────────────────────────
-# tavily_search_node  (Tavily 웹 검색)
-# ──────────────────────────────────────────────
-def tavily_search_node(state: AgentState):
-    import time
-    from langchain_community.tools.tavily_search import TavilySearchResults
-
-    question = state.get("pending_question", "")
-    if not question:
-        return {"web_search_results": []}
-
-    t0 = time.time()
-    try:
-        results = TavilySearchResults(max_results=3).invoke(question)
-        texts = [r.get("content", "") for r in results if isinstance(r, dict) and r.get("content")]
-        print(f"[Tavily] {len(texts)}건 검색 완료  ({(time.time()-t0):.2f}s)")
-        return {"web_search_results": texts}
-    except Exception as e:
-        print(f"[Tavily] 검색 실패: {e}")
-        return {"web_search_results": []}
-
-
-# ──────────────────────────────────────────────
-# answer_question_node  (요약 + Tavily 기반 3줄 답변)
-# ──────────────────────────────────────────────
-def answer_question_node(state: AgentState):
-    import time
-    from pipeline.listenlist.listen_list import ListenList
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.utils.llm import llm
-
-    question     = state.get("pending_question", "")
-    web_results  = state.get("web_search_results", [])
-
-    summary_ctx = state.get("context_summary", "").strip() or "없음"
-
-    web_section = (
-        "\n\n[최신 검색 결과]:\n" + "\n".join(f"- {r[:300]}" for r in web_results)
-        if web_results else ""
-    )
-
-    t0 = time.time()
-    prompt = (
-        f"질문: {question}\n\n"
-        f"[방송 내용 요약]:\n{summary_ctx}"
-        f"{web_section}\n\n"
-        "위 내용과 LLM 지식을 종합하여 MC가 청취자에게 전달하는 답변을 3줄 이내로 작성하세요. "
-        "자연스러운 한국어로, 핵심만 간결하게 작성하세요."
-    )
-
-    result = llm.invoke([HumanMessage(content=prompt)])
-    mc_script = result.content.strip()
-
-    print(f"[AnswerQuestion] 완료 ({(time.time()-t0):.2f}s): {mc_script[:80]}...")
-    return {
-        "mc_script":          mc_script,
-        "pending_question":   "",
-        "web_search_results": [],
-        "streaming_stage":    "Main",
-    }
+    return {"mc_script": mc_script}
 
 
 # ──────────────────────────────────────────────
