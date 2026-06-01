@@ -7,6 +7,7 @@ from pipeline.llm.utils.text_cleaner import clean_fillers
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
 import re
 import time
+from difflib import SequenceMatcher
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
@@ -22,6 +23,65 @@ _BRIDGE_COOLDOWN_S = float(_os.getenv("AI_BRIDGE_COOLDOWN_S", "25"))
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
 
+def _normalize_intent(intent: str) -> str:
+    labels = ("질문요청", "정리요청", "마무리", "설명", "질문", "대기")
+    raw = (intent or "").strip()
+    if raw in labels:
+        return raw
+    for label in labels:
+        if label in raw:
+            return label
+    return "대기"
+
+def _is_echo_script(mc_script: str, mentor_text: str) -> bool:
+    script = (mc_script or "").strip()
+    source = (mentor_text or "").strip()
+    if not script or not source:
+        return False
+    if script in source or source in script:
+        return True
+    return SequenceMatcher(None, script, source).ratio() >= 0.82
+
+def _is_low_quality_bridge(mc_script: str) -> bool:
+    script = (mc_script or "").strip()
+    if not script:
+        return True
+    generic_phrases = (
+        "현재 주제",
+        "계속 진행",
+        "논의하겠습니다",
+        "이야기를 들어보겠습니다",
+        "주요 요소",
+        "강화하는 방법",
+        "방향으로 개선",
+        "알아보겠습니다",
+        "중요합니다",
+        "더 중요합니다",
+    )
+    if any(phrase in script for phrase in generic_phrases):
+        return True
+    words = set(_WORD_CHARS.findall(script))
+    if len(words) < 8:
+        return True
+    return len(_WORD_CHARS.findall(script)) < 8
+
+def _curated_bridge(mentor_text: str) -> str:
+    text = mentor_text or ""
+    rules = [
+        (("반응", "늦", "경험"), "결국 속도도 UX의 일부라는 말이네요."),
+        (("속도", "UX"), "결국 속도도 UX의 일부라는 말이네요."),
+        (("MVP", "핵심"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
+        (("MVP", "검증"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
+        (("커뮤니케이션", "공유"), "공유 방식이 성패를 가르는 지점이네요."),
+        (("역할", "커뮤니케이션"), "공유 방식이 성패를 가르는 지점이네요."),
+        (("피드백", "개선"), "피드백을 다음 개선으로 잇는 흐름입니다."),
+        (("사용자", "흐름"), "사용자 흐름을 기준으로 보자는 얘기네요."),
+    ]
+    for keywords, bridge in rules:
+        if all(keyword in text for keyword in keywords):
+            return bridge
+    return ""
+
 
 # ──────────────────────────────────────────────
 # fast_summarize_check  (LLM 없이 키워드로 정리요청 감지)
@@ -34,6 +94,14 @@ def fast_intent_check(state: AgentState) -> str:
     if _QUESTION_REQ_RE.search(cleaned):
         print(f"[FastCheck] 질문요청 감지 → pre-computed 질문 즉시 반환")
         return "question"
+    if len(_WORD_CHARS.findall(cleaned)) < 5:
+        print("[FastCheck] short/filler utterance -> skip LLM")
+        return "wait"
+    stage = state.get("streaming_stage", "Main")
+    elapsed = time.time() - state.get("last_ai_speech_ts", 0.0)
+    if stage == "Main" and elapsed < _BRIDGE_COOLDOWN_S:
+        print(f"[FastCheck] bridge cooldown {elapsed:.0f}/{_BRIDGE_COOLDOWN_S:.0f}s -> skip LLM")
+        return "wait"
     return "analyze"
 
 
@@ -116,9 +184,27 @@ def analyze_write_node(state: AgentState):
 [대기 질문]: {q_list}{knowledge_sec}
 [멘토 발화]: "{last_message}"
 
+역할: 방송 흐름을 방해하지 않는 보조 MC.
+원칙:
+- 진행자의 말을 반복하거나 요약만 하지 마세요.
+- "현재 주제", "계속 진행", "논의하겠습니다" 같은 빈 진행 멘트는 금지.
+- 새 정보나 자연스러운 전환점이 없으면 intent는 "대기", mc_script는 "".
+- 브릿지를 할 때만, 진행자 발화의 구체 키워드 1개를 짚고 다음 흐름을 열어주는 한 문장으로 작성.
+- mc_script는 35자 이내의 짧은 한국어 한 문장.
+
+좋은 브릿지 예시:
+- 반응이 늦으면 경험이 끊긴다 → "결국 속도도 UX의 일부라는 말이네요."
+- MVP는 핵심 기능 하나를 검증한다 → "핵심 기능 하나에 초점을 맞춰보겠습니다."
+- 역할 분담보다 커뮤니케이션이 중요하다 → "공유 방식이 성패를 가르는 지점이네요."
+- 피드백을 받으며 작은 단위로 개선한다 → "피드백을 다음 개선으로 잇는 흐름입니다."
+
+나쁜 브릿지 예시:
+- "현재 주제를 계속 진행하겠습니다."
+- "이 부분에 대해 논의하겠습니다."
+- 진행자 발화를 그대로 반복한 문장.
+
 반드시 아래 JSON 형식으로만 출력하세요.
-- mc_script: 문자열이어야 함.
-{{"topic": "...", "intent": "...", "mc_script": "..."}}
+{{"topic": "...", "intent": "설명|질문|질문요청|정리요청|마무리|대기", "mc_script": "..."}}
 """
 
     t0 = time.time()
@@ -133,18 +219,34 @@ def analyze_write_node(state: AgentState):
 
     elapsed = time.time() - t0
 
-    if result.intent == "마무리":
+    normalized_intent = _normalize_intent(result.intent)
+    mc_script = (result.mc_script or "").strip()
+    if _is_echo_script(mc_script, last_message):
+        print("[AnalyzeWrite] mc_script echoes mentor text -> clear")
+        mc_script = ""
+    elif _is_low_quality_bridge(mc_script):
+        print("[AnalyzeWrite] low-quality/generic bridge -> clear")
+        mc_script = ""
+    if not mc_script and normalized_intent in ("설명", "질문"):
+        curated = _curated_bridge(last_message)
+        if curated:
+            print("[AnalyzeWrite] curated bridge applied")
+            mc_script = curated
+    if normalized_intent == "대기":
+        mc_script = ""
+
+    if normalized_intent == "마무리":
         new_stage = "Outro"
-    elif result.intent == "질문요청":
+    elif normalized_intent == "질문요청":
         new_stage = "QnA"
-    elif stage == "QnA" and result.intent not in ("질문요청", "마무리"):
+    elif stage == "QnA" and normalized_intent not in ("질문요청", "마무리"):
         new_stage = "Main"
     else:
         new_stage = stage
 
     print(f"[AnalyzeWrite] 완료  ({elapsed:.2f}s)")
-    print(f"[AnalyzeWrite] topic={result.topic} | intent={result.intent} | stage={stage}→{new_stage}")
-    print(f"[AnalyzeWrite] mc_script: \"{result.mc_script[:80]}{'...' if len(result.mc_script) > 80 else ''}\"")
+    print(f"[AnalyzeWrite] topic={result.topic} | intent={normalized_intent} | stage={stage}→{new_stage}")
+    print(f"[AnalyzeWrite] mc_script: \"{mc_script[:80]}{'...' if len(mc_script) > 80 else ''}\"")
 
 
     try:
@@ -167,9 +269,9 @@ def analyze_write_node(state: AgentState):
 
     return {
         "current_topic":   result.topic,
-        "intent":          result.intent,
+        "intent":          normalized_intent,
         "streaming_stage": new_stage,
-        "mc_script":       result.mc_script,
+        "mc_script":       mc_script,
     }
 
 

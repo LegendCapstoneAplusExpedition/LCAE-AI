@@ -1,31 +1,34 @@
 """
-Real-time TTS Pipeline using gTTS (Google Text-to-Speech)
+Real-time TTS Pipeline with pluggable synthesis engines.
 
 Architecture:
-  text input → GTTSSynthesizer → SynthesisResult callback
+  text input → BaseTTSSynthesizer → SynthesisResult callback
                                → WebSocket 전송 (백엔드) / 로컬 스피커 재생 (테스트)
 
 합성된 음성(PCM bytes + 메타데이터)은 on_synthesis 콜백으로 전달됩니다.
 이후 처리(WebSocket 송신, 저장 등)는 호출자가 담당합니다.
 
-엔진 교체: GTTSSynthesizer 대신 BaseTTSSynthesizer를 구현한 다른 클래스
-(예: OpenAITTSSynthesizer, ClovaTTSSynthesizer)를 TTSCore에 주입하면 됩니다.
+지원 엔진: ElevenLabs, Windows SAPI, gTTS.
+TTS_ENGINE 환경변수로 선택하거나 TTSCore에 synthesizer를 직접 주입하면 됩니다.
 """
 
 import asyncio
 import io
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
 import numpy as np
 import websockets
 from dotenv import load_dotenv
 
-load_dotenv()             # .env (공통 설정, git 커밋 O)
-load_dotenv(".env.local", override=True)  # .env.local (민감 정보, git 커밋 X)
+_ENV_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(_ENV_DIR / ".env")
+load_dotenv(_ENV_DIR / ".env.local", override=True)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +148,177 @@ class GTTSSynthesizer(BaseTTSSynthesizer):
         )
 
 
+class WindowsSAPISynthesizer(BaseTTSSynthesizer):
+    """Offline Windows SAPI TTS. Selects an installed voice by name/id hint."""
+
+    def __init__(self, config: TTSConfig):
+        if os.name != "nt":
+            raise RuntimeError("Windows SAPI TTS is only available on Windows")
+        import pyttsx3  # noqa: PLC0415
+
+        self.config = config
+        self.rate = int(_env("TTS_RATE", "210"))
+        self.voice_hint = _env("TTS_SAPI_VOICE", "ko-KR").strip().lower()
+
+        engine = pyttsx3.init()
+        voices = list(engine.getProperty("voices"))
+        self.voice_id = None
+
+        def voice_text(voice) -> str:
+            return " ".join([
+                str(getattr(voice, "id", "")),
+                str(getattr(voice, "name", "")),
+                " ".join(str(x) for x in getattr(voice, "languages", []) or []),
+            ]).lower()
+
+        if self.voice_hint:
+            for voice in voices:
+                if self.voice_hint in voice_text(voice):
+                    self.voice_id = voice.id
+                    break
+
+        if not self.voice_id:
+            if self.voice_hint and self.voice_hint not in {"ko", "ko-kr", "korean"}:
+                available = ", ".join(str(getattr(v, "name", "")) for v in voices)
+                print(f"[TTS] SAPI voice hint not found: {self.voice_hint} | available={available}")
+            for voice in voices:
+                haystack = voice_text(voice)
+                if "ko-kr" in haystack or "korean" in haystack:
+                    self.voice_id = voice.id
+                    break
+
+        if not self.voice_id and voices:
+            self.voice_id = voices[0].id
+
+        selected_name = "default"
+        for voice in voices:
+            if voice.id == self.voice_id:
+                selected_name = str(getattr(voice, "name", voice.id))
+                break
+        engine.stop()
+        print(f"[TTS] Windows SAPI init | voice={selected_name} | rate={self.rate}")
+
+    def synthesize(self, text: str) -> SynthesisResult:
+        import pyttsx3  # noqa: PLC0415
+        from pydub import AudioSegment  # noqa: PLC0415
+        ffmpeg_path = os.getenv("FFMPEG_PATH", "")
+        if ffmpeg_path:
+            AudioSegment.converter = ffmpeg_path
+
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            engine = pyttsx3.init()
+            if self.voice_id:
+                engine.setProperty("voice", self.voice_id)
+            engine.setProperty("rate", self.rate)
+            engine.save_to_file(text, wav_path)
+            engine.runAndWait()
+            engine.stop()
+
+            segment = AudioSegment.from_file(wav_path)
+            segment = segment.set_frame_rate(self.config.sample_rate)
+            segment = segment.set_channels(1)
+            segment = segment.set_sample_width(2)
+
+            return SynthesisResult(
+                audio=segment.raw_data,
+                sample_rate=self.config.sample_rate,
+                duration=len(segment) / 1000.0,
+                language=self.config.lang_code,
+            )
+        finally:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+
+
+class ElevenLabsSynthesizer(BaseTTSSynthesizer):
+    """ElevenLabs HTTP streaming TTS that returns raw PCM audio."""
+
+    def __init__(self, config: TTSConfig):
+        self.config = config
+        self.api_key = _env("ELEVENLABS_API_KEY", "").strip()
+        self.voice_id = _env("ELEVENLABS_VOICE_ID", "").strip()
+        self.model = _env("ELEVENLABS_MODEL", "eleven_flash_v2_5").strip()
+        self.output_format = _env("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000").strip()
+        self.base_url = _env("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io").rstrip("/")
+        self.stability = float(_env("ELEVENLABS_STABILITY", "0.45"))
+        self.similarity_boost = float(_env("ELEVENLABS_SIMILARITY_BOOST", "0.85"))
+        self.style = float(_env("ELEVENLABS_STYLE", "0.0"))
+        self.speed = float(_env("ELEVENLABS_SPEED", "1.0"))
+        self.use_speaker_boost = _env("ELEVENLABS_USE_SPEAKER_BOOST", "true").lower() == "true"
+        self._session = None
+
+        if not self.api_key:
+            raise RuntimeError("[TTS] ELEVENLABS_API_KEY is required when TTS_ENGINE=elevenlabs")
+        if not self.voice_id:
+            raise RuntimeError("[TTS] ELEVENLABS_VOICE_ID is required when TTS_ENGINE=elevenlabs")
+        if not self.output_format.startswith("pcm_"):
+            raise RuntimeError("[TTS] Use a PCM output format such as pcm_24000 for realtime RTP bridge")
+
+        try:
+            self.sample_rate = int(self.output_format.split("_", 1)[1])
+        except (IndexError, ValueError) as e:
+            raise RuntimeError(f"[TTS] Invalid ELEVENLABS_OUTPUT_FORMAT: {self.output_format}") from e
+
+        print(
+            f"[TTS] ElevenLabs init | model={self.model} | "
+            f"voice={self.voice_id} | output={self.output_format}"
+        )
+
+    def _client(self):
+        import requests  # noqa: PLC0415
+
+        if not self._session:
+            self._session = requests.Session()
+            self._session.headers.update({
+                "xi-api-key": self.api_key,
+                "accept": "audio/pcm",
+                "content-type": "application/json",
+            })
+        return self._session
+
+    def synthesize(self, text: str) -> SynthesisResult:
+        url = f"{self.base_url}/v1/text-to-speech/{self.voice_id}/stream"
+        params = {"output_format": self.output_format}
+        payload = {
+            "text": text,
+            "model_id": self.model,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+                "style": self.style,
+                "use_speaker_boost": self.use_speaker_boost,
+                "speed": self.speed,
+            },
+        }
+
+        start = time.time()
+        with self._client().post(
+            url,
+            params=params,
+            json=payload,
+            stream=True,
+            timeout=(5, 30),
+        ) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"[TTS] ElevenLabs error {response.status_code}: {response.text[:500]}")
+
+            chunks = [chunk for chunk in response.iter_content(chunk_size=4096) if chunk]
+
+        pcm_bytes = b"".join(chunks)
+        duration = len(pcm_bytes) / (self.sample_rate * 2) if self.sample_rate else 0.0
+        print(f"[TTS] ElevenLabs synthesis | elapsed={time.time() - start:.2f}s | audio={duration:.2f}s")
+        return SynthesisResult(
+            audio=pcm_bytes,
+            sample_rate=self.sample_rate,
+            duration=duration,
+            language=self.config.lang_code,
+        )
+
+
 # ---------------------------------------------------------------------------
 # TTSCore — 텍스트 입력 → SynthesisResult 콜백 (ASRCore 대칭 설계)
 # ---------------------------------------------------------------------------
@@ -178,7 +352,21 @@ class TTSCore:
                 f"[TTS] 합성 완료: {r['duration']:.2f}s | {len(r['audio'])} bytes"
             )
         )
-        self._synthesizer = synthesizer or GTTSSynthesizer(self.config)
+        engine = _env("TTS_ENGINE", "gtts").lower()
+        self._synthesis_lock = threading.Lock()
+        self._fallback_synthesizer = None
+        self._fallback_engine = None
+        if synthesizer:
+            self._synthesizer = synthesizer
+        elif engine == "sapi":
+            self._synthesizer = WindowsSAPISynthesizer(self.config)
+        elif engine == "elevenlabs":
+            self._synthesizer = ElevenLabsSynthesizer(self.config)
+            fallback_engine = _env("TTS_FALLBACK_ENGINE", "sapi").lower()
+            if fallback_engine == "sapi":
+                self._fallback_engine = fallback_engine
+        else:
+            self._synthesizer = GTTSSynthesizer(self.config)
 
     def synthesize(self, text: str):
         """텍스트 합성 요청. 결과는 on_synthesis 콜백으로 전달됩니다 (별도 스레드)."""
@@ -186,7 +374,16 @@ class TTSCore:
         t.start()
 
     def _run(self, text: str):
-        result = self._synthesizer.synthesize(text)
+        with self._synthesis_lock:
+            try:
+                result = self._synthesizer.synthesize(text)
+            except Exception as e:
+                if not self._fallback_engine:
+                    raise
+                print(f"[TTS] primary synthesis failed, using fallback: {e}")
+                if not self._fallback_synthesizer:
+                    self._fallback_synthesizer = WindowsSAPISynthesizer(self.config)
+                result = self._fallback_synthesizer.synthesize(text)
         self.on_synthesis(result)
 
 

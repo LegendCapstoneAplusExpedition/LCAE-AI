@@ -130,11 +130,11 @@ class WhisperTranscriber:
         compute_type = config.compute_type
 
         # device/compute_type 자동 설정
-        if device == "auto": 
+        if device == "auto":
             try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
+                import ctranslate2
+                device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+            except Exception:
                 device = "cpu"
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
