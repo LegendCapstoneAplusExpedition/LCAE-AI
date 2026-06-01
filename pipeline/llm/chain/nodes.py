@@ -1,5 +1,6 @@
 from langchain_core.messages import AIMessage
 from langchain_chroma import Chroma
+from pathlib import Path
 from pipeline.llm.utils.llm import llm_structured
 from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
@@ -8,9 +9,23 @@ import re
 import time
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
+_SUMMARIZE_RE = re.compile(r'(정리해|요약해|지금까지\s*내용)')
+
+_READY_SUMMARY_PATH = Path(__file__).parent.parent.parent / "listenlist" / "ready_summary.json"
 
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
+
+
+# ──────────────────────────────────────────────
+# fast_summarize_check  (LLM 없이 키워드로 정리요청 감지)
+# ──────────────────────────────────────────────
+def fast_summarize_check(state: AgentState) -> str:
+    cleaned = state.get("cleaned_text", "").strip()
+    if _SUMMARIZE_RE.search(cleaned):
+        print(f"[FastCheck] 정리요청 감지 → pre-computed 요약 즉시 반환")
+        return "summarize"
+    return "analyze"
 
 
 # ──────────────────────────────────────────────
@@ -129,6 +144,16 @@ def analyze_write_node(state: AgentState):
         "mc_script":       result.mc_script,
     }
 
+    if result.summary:
+        try:
+            import json as _json
+            _READY_SUMMARY_PATH.write_text(
+                _json.dumps({"time": time.strftime("%H:%M:%S"), "summary": result.summary}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
 
 # ──────────────────────────────────────────────
 # decision_node  (즉시, 규칙 기반 라우팅 함수)
@@ -164,14 +189,25 @@ def decision_node(state: AgentState) -> str:
 # summarize_listenlist_node  (summary.jsonl 기반 1줄 요약)
 # ──────────────────────────────────────────────
 def summarize_listenlist_node(state: AgentState):
-    context_summary = state.get("context_summary", "").strip()
+    import json as _json
 
-    if not context_summary:
-        print("[Summarize] context_summary 없음")
+    summary = ""
+    if _READY_SUMMARY_PATH.exists():
+        try:
+            data = _json.loads(_READY_SUMMARY_PATH.read_text(encoding="utf-8"))
+            summary = data.get("summary", "").strip()
+        except Exception:
+            pass
+
+    if not summary:
+        summary = state.get("context_summary", "").strip()
+
+    if not summary:
+        print("[Summarize] 요약 없음")
         return {"mc_script": "아직 요약할 방송 내용이 없습니다."}
 
-    print(f"[Summarize] context_summary 사용: {context_summary[:60]}...")
-    return {"mc_script": context_summary}
+    print(f"[Summarize] pre-computed 요약 반환: {summary[:60]}...")
+    return {"mc_script": summary}
 
 
 # ──────────────────────────────────────────────

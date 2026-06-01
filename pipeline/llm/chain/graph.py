@@ -4,6 +4,7 @@ from pipeline.llm.chain.nodes import (
     preprocess_node,
     knowledge_search_node,
     analyze_write_node,
+    fast_summarize_check,
     decision_node,
     decision_search_node,
     summarize_listenlist_node,
@@ -28,9 +29,18 @@ workflow.add_node("answer_question",      answer_question_node)
 workflow.add_node("output",               output_node)
 
 # ── 고정 엣지 ────────────────────────────────────────────────────────────────
-workflow.add_edge(START,             "preprocess")
-workflow.add_edge("preprocess",      "search")
-workflow.add_edge("search",          "analyze_write")
+workflow.add_edge(START,        "preprocess")
+workflow.add_edge("preprocess", "search")
+
+# search 이후 정리요청 키워드 감지 시 LLM 없이 즉시 요약 반환
+workflow.add_conditional_edges(
+    "search",
+    fast_summarize_check,
+    {
+        "summarize": "summarize_listenlist",
+        "analyze":   "analyze_write",
+    }
+)
 
 # ── analyze_write 이후 5-way 분기 ───────────────────────────────────────────
 # summarize    : "정리요청" → summary.jsonl 1줄 요약
