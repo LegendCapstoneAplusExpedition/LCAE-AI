@@ -12,8 +12,12 @@ _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
 _QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있어요|들어왔)|다음\s*질문|궁금한\s*거)')
 
+import os as _os
 _READY_SUMMARY_PATH  = Path(__file__).parent.parent.parent / "listenlist" / "ready_summary.json"
 _READY_QUESTION_PATH = Path(__file__).parent.parent.parent / "listenlist" / "ready_question.json"
+
+# 진행자 브릿지 멘트 발화 쿨다운(초). 이 시간 안에는 설명/질문에 다시 끼어들지 않음.
+_BRIDGE_COOLDOWN_S = float(_os.getenv("AI_BRIDGE_COOLDOWN_S", "25"))
 
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
@@ -189,10 +193,27 @@ def decision_node(state: AgentState) -> str:
         print(f"[Decision] intent=\"{intent}\" → ask_question")
         return "ask_question"
 
-    should_speak = intent == "마무리"
-    decision = "speak" if should_speak else "wait"
-    print(f"[Decision] intent=\"{intent}\" → {decision}")
-    return decision
+    # 마무리는 항상 발화
+    if intent == "마무리":
+        print(f"[Decision] intent=\"{intent}\" → speak")
+        return "speak"
+
+    # 설명·질문: 진행자 브릿지 멘트가 있으면 발화하되, 쿨다운으로 페이싱.
+    # (멘토가 말할 때마다 끼어들지 않고, 마지막 발화 후 일정 시간 경과 시에만 반응)
+    if intent in ("설명", "질문"):
+        mc = state.get("mc_script", "").strip()
+        if not mc:
+            print(f"[Decision] intent=\"{intent}\" → wait (브릿지 멘트 없음)")
+            return "wait"
+        elapsed = time.time() - state.get("last_ai_speech_ts", 0.0)
+        if elapsed >= _BRIDGE_COOLDOWN_S:
+            print(f"[Decision] intent=\"{intent}\" → speak (쿨다운 경과 {elapsed:.0f}s)")
+            return "speak"
+        print(f"[Decision] intent=\"{intent}\" → wait (쿨다운 {elapsed:.0f}/{_BRIDGE_COOLDOWN_S:.0f}s)")
+        return "wait"
+
+    print(f"[Decision] intent=\"{intent}\" → wait")
+    return "wait"
 
 
 # ──────────────────────────────────────────────
@@ -261,6 +282,7 @@ def output_node(state: AgentState):
     print(f"[Output] 최종 멘트: \"{mc_script}\"")
     return {
         "messages": [AIMessage(content=mc_script)],
+        "last_ai_speech_ts": time.time(),  # 쿨다운 기준 시각 갱신
     }
 
 

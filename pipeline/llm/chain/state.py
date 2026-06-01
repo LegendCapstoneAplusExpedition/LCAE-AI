@@ -30,6 +30,10 @@ class AgentState(TypedDict):
     # 분석+작성 통합 결과
     mc_script: str       # analyze_write_node가 생성한 MC 멘트 (output_node에서 messages로 이동)
 
+    # 발화 페이싱 (진행자가 무지성으로 떠들지 않도록 제어)
+    silence_duration: float    # 직전 발화 후 멘토 침묵 시간(초)
+    last_ai_speech_ts: float   # AI가 마지막으로 발화한 시각(time.time()). 쿨다운 계산용
+
 
 
 

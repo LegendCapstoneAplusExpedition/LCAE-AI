@@ -10,4 +10,6 @@ def mentor_setup(topics: list[str]) -> dict:
         "intent":             "",
         "cleaned_text":       "",
         "mc_script":          "",
+        "silence_duration":   0.0,
+        "last_ai_speech_ts":  0.0,
     }
