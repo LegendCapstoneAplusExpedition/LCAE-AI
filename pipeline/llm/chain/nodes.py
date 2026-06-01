@@ -99,19 +99,22 @@ def analyze_write_node(state: AgentState):
             "mc_script":       "",
         }
 
-    # 프롬프트에 넣는 요약은 최신 3문장으로 제한 (토큰 증가 방지)
+    broadcast_topics = state.get("broadcast_topics", [])
+    current_topic    = state.get("current_topic", "")
+    topics_sec  = f"[방송 주제]: {', '.join(broadcast_topics)}" if broadcast_topics else ""
+    current_sec = f"[현재 주제]: {current_topic}" if current_topic else ""
     q_list        = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
     knowledge_sec = f"\n[검색된 참고 지식]:\n{knowledge}" if knowledge else ""
 
-    prompt = f"""[이전 단계]: {stage}
-[누적 요약]: {prev_summary if prev_summary else "없음"}
+    prompt = f"""{topics_sec}
+{current_sec}
+[이전 단계]: {stage}
 [대기 질문]: {q_list}{knowledge_sec}
 [멘토 발화]: "{last_message}"
 
-반드시 아래 JSON 형식으로만 출력하세요. 규칙:
-- summary: 누적 요약에 이번 발화의 핵심만 1~2문장으로 추가. 기존 내용은 삭제하지 말 것. 메타 발화("정리해줘" 등)는 제외.
+반드시 아래 JSON 형식으로만 출력하세요.
 - mc_script: 문자열이어야 함.
-{{"topic": "...", "summary": "...", "intent": "...", "mc_script": "..."}}
+{{"topic": "...", "intent": "...", "mc_script": "..."}}
 """
 
     t0 = time.time()
@@ -126,7 +129,6 @@ def analyze_write_node(state: AgentState):
 
     elapsed = time.time() - t0
 
-    # streaming_stage: intent 기반 전환 (LLM 출력 아님)
     if result.intent == "마무리":
         new_stage = "Outro"
     elif result.intent == "질문요청":
@@ -138,18 +140,8 @@ def analyze_write_node(state: AgentState):
 
     print(f"[AnalyzeWrite] 완료  ({elapsed:.2f}s)")
     print(f"[AnalyzeWrite] topic={result.topic} | intent={result.intent} | stage={stage}→{new_stage}")
-    print(f"[AnalyzeWrite] summary: {result.summary}")
     print(f"[AnalyzeWrite] mc_script: \"{result.mc_script[:80]}{'...' if len(result.mc_script) > 80 else ''}\"")
 
-    if result.summary:
-        try:
-            import json as _json
-            _READY_SUMMARY_PATH.write_text(
-                _json.dumps({"time": time.strftime("%H:%M:%S"), "summary": result.summary}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
 
     try:
         import json as _json, os as _os
@@ -171,7 +163,6 @@ def analyze_write_node(state: AgentState):
 
     return {
         "current_topic":   result.topic,
-        "context_summary": result.summary,
         "intent":          result.intent,
         "streaming_stage": new_stage,
         "mc_script":       result.mc_script,
