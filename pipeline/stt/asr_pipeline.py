@@ -99,6 +99,7 @@ class SileroVAD:
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
+            trust_repo=True,
         )
         self.get_speech_timestamps = self.utils[0]
         self.sample_rate = sample_rate

@@ -33,13 +33,13 @@ from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
 from pipeline.listenlist import AIOutputList, ListenList
 
 
-def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None):
+def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None, on_synthesis=None):
     """STT → LLM → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
     from pipeline.llm.chain.setup import mentor_setup
     from pipeline.llm.chain.graph import app as llm_app
     from langchain_core.messages import HumanMessage, AIMessage
 
-    tts = TTSCore(tts_config, on_synthesis=_on_synthesis)
+    tts = TTSCore(tts_config, on_synthesis=on_synthesis or _on_synthesis)
     # 방송 세션 상태 — 호출 간 누적됨 (topics 기반으로 초기화)
     state = mentor_setup(topics or [])
     listen_list = ListenList()
@@ -167,23 +167,44 @@ def main() -> None:
         ws_uri=args.tts_ws_uri,
     )
 
-    on_transcription = build_pipeline(stt_config, tts_config)
-
     if args.mode == "mic":
+        on_transcription = build_pipeline(stt_config, tts_config)
         test = MicrophoneASRTest(stt_config, on_transcription=on_transcription)
         test.run(device=args.mic_device)
 
     elif args.mode == "server":
         import asyncio
         from pipeline.stt import RealtimeASRServer
-        server = RealtimeASRServer(host=args.host, port=args.port,
-                                   config=stt_config,
-                                   on_transcription=lambda r, _: on_transcription(r))
-        asyncio.run(server.serve())
+
+        _ctx: dict = {"ws": None, "loop": None}
+
+        def on_synthesis_server(result: SynthesisResult) -> None:
+            ws = _ctx["ws"]
+            loop = _ctx["loop"]
+            if ws is not None and loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(ws.send(result["audio"]), loop)
+
+        on_transcription = build_pipeline(stt_config, tts_config, on_synthesis=on_synthesis_server)
+
+        def on_transcription_with_ws(result, websocket) -> None:
+            _ctx["ws"] = websocket
+            on_transcription(result)
+
+        async def run_server():
+            _ctx["loop"] = asyncio.get_running_loop()
+            server = RealtimeASRServer(
+                host=args.host, port=args.port,
+                config=stt_config,
+                on_transcription=on_transcription_with_ws,
+            )
+            await server.serve()
+
+        asyncio.run(run_server())
 
     elif args.mode == "client":
         import asyncio
         from pipeline.stt import RealtimeASRPipeline
+        on_transcription = build_pipeline(stt_config, tts_config)
         client = RealtimeASRPipeline(config=stt_config, on_transcription=on_transcription)
         try:
             asyncio.run(client.run())
