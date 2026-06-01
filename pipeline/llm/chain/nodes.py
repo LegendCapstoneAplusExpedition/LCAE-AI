@@ -3,7 +3,6 @@ from langchain_chroma import Chroma
 from pipeline.llm.utils.llm import llm_structured
 from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
-from pipeline.llm.prompts.persona import SYSTEM_PROMPT
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
 import re
 import time
@@ -81,19 +80,16 @@ def analyze_write_node(state: AgentState):
         }
 
     # 프롬프트에 넣는 요약은 최신 3문장으로 제한 (토큰 증가 방지)
-    _sentences = [s.strip() for s in re.split(r'(?<=[.!?。])\s+', prev_summary) if s.strip()]
-    summary_for_prompt = " ".join(_sentences[-3:]) if _sentences else "없음"
-
     q_list        = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
     knowledge_sec = f"\n[검색된 참고 지식]:\n{knowledge}" if knowledge else ""
 
     prompt = f"""[이전 단계]: {stage}
-[이전 요약]: {summary_for_prompt}
+[누적 요약]: {prev_summary if prev_summary else "없음"}
 [대기 질문]: {q_list}{knowledge_sec}
 [멘토 발화]: "{last_message}"
 
 반드시 아래 JSON 형식으로만 출력하세요. 규칙:
-- summary: 이전 요약 + 이번 발화를 합쳐 3문장 이내로 압축 재작성. 이전 요약 문장을 그대로 복사하지 말 것. 메타 발화("정리해줘" 등)는 제외. 반드시 1문장 이상.
+- summary: 누적 요약에 이번 발화의 핵심만 1~2문장으로 추가. 기존 내용은 삭제하지 말 것. 메타 발화("정리해줘" 등)는 제외.
 - mc_script: 문자열이어야 함.
 {{"topic": "...", "summary": "...", "intent": "...", "mc_script": "..."}}
 """
@@ -105,7 +101,6 @@ def analyze_write_node(state: AgentState):
         AnalyzeAndWriteResult,
         method="json_mode",
     ).invoke([
-        ("system", SYSTEM_PROMPT),
         ("human", prompt),
     ])
 
@@ -169,35 +164,14 @@ def decision_node(state: AgentState) -> str:
 # summarize_listenlist_node  (summary.jsonl 기반 1줄 요약)
 # ──────────────────────────────────────────────
 def summarize_listenlist_node(state: AgentState):
-    import time
-    from pipeline.listenlist.listen_list import ListenList
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.utils.llm import llm
+    context_summary = state.get("context_summary", "").strip()
 
-    t0 = time.time()
-    summaries = ListenList().read_summaries()
+    if not context_summary:
+        print("[Summarize] context_summary 없음")
+        return {"mc_script": "아직 요약할 방송 내용이 없습니다."}
 
-    if not summaries:
-        mc_script = "아직 요약할 방송 내용이 없습니다."
-        print("[Summarize] summary.jsonl 비어있음")
-        return {"mc_script": mc_script}
-
-    combined = "\n".join(
-        f"[{s.get('time','')}] 키워드: {', '.join(s.get('keywords',[]))}  내용: {s.get('summary','')}"
-        for s in summaries
-    )
-    prompt = (
-        "다음은 방송에서 나온 주요 내용의 요약 목록입니다.\n\n"
-        f"{combined}\n\n"
-        "전체 내용을 MC가 청취자에게 말하는 자연스러운 한 문장(1줄)으로 압축하세요. "
-        "다른 설명 없이 문장만 출력하세요."
-    )
-
-    result = llm.invoke([HumanMessage(content=prompt)])
-    mc_script = result.content.strip()
-
-    print(f"[Summarize] 완료 ({(time.time()-t0):.2f}s): {mc_script}")
-    return {"mc_script": mc_script}
+    print(f"[Summarize] context_summary 사용: {context_summary[:60]}...")
+    return {"mc_script": context_summary}
 
 
 # ──────────────────────────────────────────────
@@ -206,47 +180,25 @@ def summarize_listenlist_node(state: AgentState):
 def generate_question_node(state: AgentState):
     import os
     import time
-    from pipeline.listenlist.listen_list import ListenList
     from pipeline.listenlist.chat_list import ChatList
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.utils.llm import llm
 
     t0 = time.time()
-    question = ""
-    mc_script = ""
 
-    # 1. 실시간 채팅 로그(chat.jsonl)에서 아직 사용하지 않은 질문 확인
     broadcast_id = os.getenv("BROADCAST_ID", "").strip() or None
     chat_question = ChatList().pop_next_question(broadcast_id=broadcast_id)
-    if chat_question:
-        question = chat_question.get("message", "").strip()
-        username = chat_question.get("username", "").strip()
-        mc_script = f"{username}님 질문입니다. {question}" if username else question
-        print(f"[GenerateQuestion] 채팅에서 질문 가져옴: {question}")
 
-    # 2. 채팅 질문이 없으면 summary.jsonl 기반 질문 생성 if not question:
-        summaries = ListenList().read_summaries()
+    if not chat_question:
+        print(f"[GenerateQuestion] 대기 질문 없음 ({(time.time()-t0)*1000:.1f}ms)")
+        return {
+            "mc_script":        "현재 대기 중인 질문이 없습니다.",
+            "pending_question": "",
+        }
 
-        if not summaries:
-            mc_script = "질문거리를 찾지 못했습니다. 청취자분들이 궁금한 점 있으시면 말씀해 주세요."
-            return {"mc_script": mc_script, "pending_question": ""}
+    question = chat_question.get("message", "").strip()
+    username = chat_question.get("username", "").strip()
+    mc_script = f"{username}님 질문입니다. {question}" if username else question
 
-        recent = summaries[-3:]
-        combined = "\n".join(
-            f"[{s.get('time','')}] {', '.join(s.get('keywords',[]))}: {s.get('summary','')}"
-            for s in recent
-        )
-        prompt = (
-            "다음은 최근 방송 내용의 요약입니다.\n\n"
-            f"{combined}\n\n"
-            "이 내용을 바탕으로 청취자나 게스트가 흥미를 가질 만한 질문 하나를 생성하세요. "
-            "MC가 직접 묻는 자연스러운 한국어 질문 문장으로 작성하고, 다른 설명 없이 질문만 출력하세요."
-        )
-        result = llm.invoke([HumanMessage(content=prompt)])
-        question = result.content.strip()
-        mc_script = question
-        print(f"[GenerateQuestion] summary 기반 생성 ({(time.time()-t0):.2f}s): {question}")
-
+    print(f"[GenerateQuestion] 질문 가져옴 ({(time.time()-t0)*1000:.1f}ms): {question}")
     return {"mc_script": mc_script, "pending_question": question}
 
 
@@ -317,10 +269,7 @@ def answer_question_node(state: AgentState):
     question     = state.get("pending_question", "")
     web_results  = state.get("web_search_results", [])
 
-    summaries = ListenList().read_summaries()
-    summary_ctx = "\n".join(
-        f"[{s.get('time','')}] {s.get('summary','')}" for s in summaries
-    ) if summaries else "없음"
+    summary_ctx = state.get("context_summary", "").strip() or "없음"
 
     web_section = (
         "\n\n[최신 검색 결과]:\n" + "\n".join(f"- {r[:300]}" for r in web_results)
