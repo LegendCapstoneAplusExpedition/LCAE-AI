@@ -11,5 +11,4 @@ def mentor_setup(topics: list[str]) -> dict:
         "intent":             "",
         "cleaned_text":       "",
         "mc_script":          "",
-        "listen_summaries":   [],
     }

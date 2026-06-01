@@ -205,7 +205,7 @@ def decision_node(state: AgentState) -> str:
 
 
 # ──────────────────────────────────────────────
-# summarize_listenlist_node  (summary.jsonl 기반 1줄 요약)
+# summarize_listenlist_node  (ready_summary.json 기반 즉시 반환)
 # ──────────────────────────────────────────────
 def summarize_listenlist_node(state: AgentState):
     import json as _json
@@ -230,7 +230,7 @@ def summarize_listenlist_node(state: AgentState):
 
 
 # ──────────────────────────────────────────────
-# generate_question_node  (채팅 DB → summary.jsonl 기반 질문 생성)
+# generate_question_node  (chat.jsonl에서 질문 pop)
 # ──────────────────────────────────────────────
 def generate_question_node(state: AgentState):
     import os

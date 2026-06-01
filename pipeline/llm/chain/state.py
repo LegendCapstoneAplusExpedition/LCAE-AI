@@ -31,8 +31,6 @@ class AgentState(TypedDict):
     # 분석+작성 통합 결과
     mc_script: str       # analyze_write_node가 생성한 MC 멘트 (output_node에서 messages로 이동)
 
-    # ListenList 요약 기록 (summary.jsonl)
-    listen_summaries: List[dict]
 
 
 
