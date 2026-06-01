@@ -133,6 +133,8 @@ def main() -> None:
     parser.add_argument("--host", default=os.getenv("WS_SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("WS_SERVER_PORT", "8765")))
     parser.add_argument("--ws-uri", default=os.getenv("WS_URI", "ws://localhost:8080/audio"))
+    parser.add_argument("--topic", default=os.getenv("BROADCAST_TOPIC", ""),
+                        help="방송 주제(제목). LLM 환각 감소를 위해 초기 컨텍스트로 사용")
 
     # STT 설정
     parser.add_argument("--model", default=os.getenv("ASR_MODEL", "base"),
@@ -167,8 +169,12 @@ def main() -> None:
         ws_uri=args.tts_ws_uri,
     )
 
+    topics = [args.topic.strip()] if args.topic and args.topic.strip() else []
+    if topics:
+        print(f"[시작] 방송 주제 전달: {topics[0]}")
+
     if args.mode == "mic":
-        on_transcription = build_pipeline(stt_config, tts_config)
+        on_transcription = build_pipeline(stt_config, tts_config, topics=topics)
         test = MicrophoneASRTest(stt_config, on_transcription=on_transcription)
         test.run(device=args.mic_device)
 
@@ -184,7 +190,7 @@ def main() -> None:
             if ws is not None and loop is not None and loop.is_running():
                 asyncio.run_coroutine_threadsafe(ws.send(result["audio"]), loop)
 
-        on_transcription = build_pipeline(stt_config, tts_config, on_synthesis=on_synthesis_server)
+        on_transcription = build_pipeline(stt_config, tts_config, topics=topics, on_synthesis=on_synthesis_server)
 
         def on_transcription_with_ws(result, websocket) -> None:
             _ctx["ws"] = websocket
@@ -204,7 +210,7 @@ def main() -> None:
     elif args.mode == "client":
         import asyncio
         from pipeline.stt import RealtimeASRPipeline
-        on_transcription = build_pipeline(stt_config, tts_config)
+        on_transcription = build_pipeline(stt_config, tts_config, topics=topics)
         client = RealtimeASRPipeline(config=stt_config, on_transcription=on_transcription)
         try:
             asyncio.run(client.run())
