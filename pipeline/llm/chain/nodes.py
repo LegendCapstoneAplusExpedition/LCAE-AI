@@ -9,9 +9,11 @@ import re
 import time
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
-_SUMMARIZE_RE = re.compile(r'(정리해|요약해|지금까지\s*내용)')
+_SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
+_QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있어요|들어왔)|다음\s*질문|궁금한\s*거)')
 
-_READY_SUMMARY_PATH = Path(__file__).parent.parent.parent / "listenlist" / "ready_summary.json"
+_READY_SUMMARY_PATH  = Path(__file__).parent.parent.parent / "listenlist" / "ready_summary.json"
+_READY_QUESTION_PATH = Path(__file__).parent.parent.parent / "listenlist" / "ready_question.json"
 
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
@@ -20,11 +22,14 @@ _db_has_data = _vector_db._collection.count() > 0
 # ──────────────────────────────────────────────
 # fast_summarize_check  (LLM 없이 키워드로 정리요청 감지)
 # ──────────────────────────────────────────────
-def fast_summarize_check(state: AgentState) -> str:
+def fast_intent_check(state: AgentState) -> str:
     cleaned = state.get("cleaned_text", "").strip()
     if _SUMMARIZE_RE.search(cleaned):
         print(f"[FastCheck] 정리요청 감지 → pre-computed 요약 즉시 반환")
         return "summarize"
+    if _QUESTION_REQ_RE.search(cleaned):
+        print(f"[FastCheck] 질문요청 감지 → pre-computed 질문 즉시 반환")
+        return "question"
     return "analyze"
 
 
@@ -153,6 +158,24 @@ def analyze_write_node(state: AgentState):
             )
         except Exception:
             pass
+
+    try:
+        import json as _json, os as _os
+        from pipeline.listenlist.chat_list import ChatList as _ChatList
+        broadcast_id = _os.getenv("BROADCAST_ID", "").strip() or None
+        next_q = _ChatList().peek_next_question(broadcast_id=broadcast_id)
+        if next_q:
+            question = next_q.get("message", "").strip()
+            username = next_q.get("username", "").strip()
+            mc_text = f"{username}님 질문입니다. {question}" if username else question
+            _READY_QUESTION_PATH.write_text(
+                _json.dumps({"time": time.strftime("%H:%M:%S"), "mc_text": mc_text}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        elif _READY_QUESTION_PATH.exists():
+            _READY_QUESTION_PATH.unlink()
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────

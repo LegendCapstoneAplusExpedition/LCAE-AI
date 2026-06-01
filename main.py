@@ -23,7 +23,7 @@ _LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
 
 def _clear_session_files() -> None:
     _LISTENLIST_DIR.mkdir(parents=True, exist_ok=True)
-    for fname in ("transcriptions.jsonl", "chat.jsonl", "ai_outputs.jsonl", "ready_summary.json"):
+    for fname in ("transcriptions.jsonl", "chat.jsonl", "ai_outputs.jsonl", "ready_summary.json", "ready_question.json"):
         fpath = _LISTENLIST_DIR / fname
         fpath.write_text("", encoding="utf-8")
         print(f"[시작] {fname} 초기화 완료")

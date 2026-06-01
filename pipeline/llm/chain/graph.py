@@ -4,7 +4,7 @@ from pipeline.llm.chain.nodes import (
     preprocess_node,
     knowledge_search_node,
     analyze_write_node,
-    fast_summarize_check,
+    fast_intent_check,
     decision_node,
     decision_search_node,
     summarize_listenlist_node,
@@ -32,22 +32,18 @@ workflow.add_node("output",               output_node)
 workflow.add_edge(START,        "preprocess")
 workflow.add_edge("preprocess", "search")
 
-# search 이후 정리요청 키워드 감지 시 LLM 없이 즉시 요약 반환
+# search 이후 키워드로 정리요청·질문요청 감지 시 LLM 없이 즉시 분기
 workflow.add_conditional_edges(
     "search",
-    fast_summarize_check,
+    fast_intent_check,
     {
         "summarize": "summarize_listenlist",
+        "question":  "generate_question",
         "analyze":   "analyze_write",
     }
 )
 
 # ── analyze_write 이후 5-way 분기 ───────────────────────────────────────────
-# summarize    : "정리요청" → summary.jsonl 1줄 요약
-# ask_question : "질문요청" → 채팅DB or summary 기반 질문 생성
-# answer_question: QnA 스테이지 + pending_question → 웹 검색 여부 판단
-# speak        : "마무리" → 기존 output 경로
-# wait         : 그 외 → 개입 없이 대기
 workflow.add_conditional_edges(
     "analyze_write",
     decision_node,
@@ -61,7 +57,6 @@ workflow.add_conditional_edges(
 )
 
 # ── QnA 답변 서브그래프 ──────────────────────────────────────────────────────
-# assess_search → (search → tavily_search → answer_question) or (direct → answer_question)
 workflow.add_conditional_edges(
     "assess_search",
     decision_search_node,

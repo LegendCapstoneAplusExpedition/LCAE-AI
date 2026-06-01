@@ -35,6 +35,20 @@ class ChatList:
         with self._lock:
             return self._read()
 
+    def peek_next_question(self, broadcast_id: str | None = None) -> dict | None:
+        """아직 사용하지 않은 첫 질문을 반환 (소비하지 않음)."""
+        with self._lock:
+            entries = self._read()
+            for entry in entries:
+                if entry.get("used"):
+                    continue
+                if broadcast_id and entry.get("broadcast_id") != broadcast_id:
+                    continue
+                message = str(entry.get("message", "")).strip()
+                if entry.get("is_question") or _QUESTION_RE.search(message):
+                    return entry
+        return None
+
     def pop_next_question(self, broadcast_id: str | None = None) -> dict | None:
         """아직 사용하지 않은 첫 질문 채팅을 반환하고 used=true로 표시."""
         with self._lock:
