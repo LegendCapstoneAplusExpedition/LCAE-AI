@@ -48,6 +48,10 @@ huggingface/
 tmp/
 logs/
 
+# 방송 런타임 버퍼
+pipeline/listenlist/*.jsonl
+pipeline/listenlist/ready_*.json
+
 # 오디오 테스트 파일
 *.wav
 *.mp3

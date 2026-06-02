@@ -67,17 +67,20 @@ class ListenList:
         """실제 전사 텍스트 기반으로 LLM 요약 → ready_summary.json 저장."""
         try:
             from langchain_core.messages import HumanMessage
-            from pipeline.llm.utils.llm import llm
+            from pipeline.llm.utils.llm import llm_summary
 
             texts = "\n".join(f"[{e['time']}] {e['text']}" for e in entries)
             prompt = (
-                "다음은 방송에서 실제로 전사된 내용입니다.\n\n"
+                "다음은 방송에서 실제로 전사된 멘토 발화 목록입니다.\n\n"
                 f"{texts}\n\n"
-                "위 내용만을 바탕으로 3문장 이내로 요약하세요. "
-                "전사된 내용 외의 정보나 추측은 절대 추가하지 마세요. "
-                "다른 설명 없이 요약문만 출력하세요."
+                "요약 규칙:\n"
+                "- 위 전사에 명시된 내용만 바탕으로 요약하세요.\n"
+                "- 전사에 없는 주제, 배경, 조언, 학습 데이터의 표현을 추가하지 마세요.\n"
+                "- 잡음, 인사, 테스트 발화, 요약 요청 문장 자체는 핵심 내용이 아니면 제외하세요.\n"
+                "- 핵심 방송 내용이 부족하면 정확히 '아직 요약할 핵심 내용이 없습니다.'라고만 출력하세요.\n"
+                "- 1~3문장으로, 다른 설명 없이 요약문만 출력하세요."
             )
-            result = llm.invoke([HumanMessage(content=prompt)])
+            result = llm_summary.invoke([HumanMessage(content=prompt)])
             summary = result.content.strip()
 
             _READY_SUMMARY_PATH.write_text(
