@@ -85,7 +85,6 @@ def analyze_write_node(state: AgentState):
     last_message = cleaned if cleaned else state["messages"][-1].content
     prev_summary = state.get("context_summary", "")
     stage        = state.get("streaming_stage", "Main")
-    question_queue = state.get("question_queue", [])
     knowledge    = "\n".join(state.get("retrieved_info", []))
 
     # 유효 글자(한글·영문·숫자) 5자 미만 → 필러/추임새, LLM 스킵
@@ -103,13 +102,12 @@ def analyze_write_node(state: AgentState):
     current_topic    = state.get("current_topic", "")
     topics_sec  = f"[방송 주제]: {', '.join(broadcast_topics)}" if broadcast_topics else ""
     current_sec = f"[현재 주제]: {current_topic}" if current_topic else ""
-    q_list        = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
     knowledge_sec = f"\n[검색된 참고 지식]:\n{knowledge}" if knowledge else ""
 
     prompt = f"""{topics_sec}
 {current_sec}
 [이전 단계]: {stage}
-[대기 질문]: {q_list}{knowledge_sec}
+{knowledge_sec}
 [멘토 발화]: "{last_message}"
 
 반드시 아래 JSON 형식으로만 출력하세요.
@@ -175,7 +173,6 @@ def analyze_write_node(state: AgentState):
 def decision_node(state: AgentState) -> str:
     intent  = state.get("intent", "")
     stage   = state.get("streaming_stage", "Main")
-    pending = state.get("pending_question", "")
 
     if stage == "Outro" and intent == "마무리":
         print(f"[Decision] Outro 진입 완료 → 추가 클로징 차단")
@@ -210,9 +207,6 @@ def summarize_listenlist_node(state: AgentState):
             pass
 
     if not summary:
-        summary = state.get("context_summary", "").strip()
-
-    if not summary:
         print("[Summarize] 요약 없음")
         return {"mc_script": "아직 요약할 방송 내용이 없습니다."}
 
@@ -245,7 +239,10 @@ def generate_question_node(state: AgentState):
     mc_script = f"{username}님 질문입니다. {question}" if username else question
 
     print(f"[GenerateQuestion] 질문 가져옴 ({(time.time()-t0)*1000:.1f}ms): {question}")
-    return {"mc_script": mc_script}
+    return {
+        "mc_script": mc_script,
+        "pending_question": question,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -262,81 +259,3 @@ def output_node(state: AgentState):
     return {
         "messages": [AIMessage(content=mc_script)],
     }
-
-
-if __name__ == "__main__":
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.chain.setup import mentor_setup
-
-    # 방송 전: 멘토가 주제 키워드 사전 입력
-    BASE = mentor_setup(["주니어-시니어 성장", "번아웃 예방", "MVP 전략", "프리랜서 단가"])
-    print(f"[Setup] broadcast_topics={BASE['broadcast_topics']}")
-    print(f"[Setup] current_topic={BASE['current_topic']} | streaming_stage={BASE['streaming_stage']}")
-
-    CASES = [
-        # streaming_stage 없음 — LLM이 발화 맥락만 보고 스스로 판단
-        {
-            "_desc": "케이스1: 짧은 filler (대기 예상)",
-            "messages":        [HumanMessage(content="음... 그러니까 그게 말이죠.")],
-            "silence_duration": 1.0,
-            "question_queue":  [],
-            "current_topic":   "주니어-시니어 성장",
-            "context_summary": "시니어는 기술 스택보다 문제 정의 능력이 중요하다.",
-        },
-        {
-            "_desc": "케이스2: 실질 내용 발화 (브릿지 멘트 예상)",
-            "messages":        [HumanMessage(content="번아웃은 시간 관리 실패가 아니라 의미를 잃었을 때 생겨요. 작은 완성 경험을 쌓는 게 핵심이에요.")],
-            "silence_duration": 3.5,
-            "question_queue":  [],
-            "current_topic":   "번아웃 예방 전략",
-            "context_summary": "하루를 집중 블록과 커뮤니케이션 블록으로 나누는 것이 효과적이다.",
-        },
-        {
-            "_desc": "케이스3: 정리요청 — 누적 요약 읽기 예상",
-            "messages":        [HumanMessage(content="지금까지 내용 정리해주세요.")],
-            "silence_duration": 2.0,
-            "question_queue":  [],
-            "current_topic":   "MVP 최소 기능 정의",
-            "context_summary": "사이드 프로젝트는 고객 인터뷰 5개로 수요 검증 후 시작해야 한다. MVP는 핵심 기능 하나로 빠르게 출시하는 것이 효율적이다.",
-        },
-        {
-            "_desc": "케이스4: 질문요청 — 대기 질문 전달 예상",
-            "messages":        [HumanMessage(content="잠깐 질문 받을게요.")],
-            "silence_duration": 2.0,
-            "question_queue":  ["단가 인상은 언제 하는 게 좋나요?", "포트폴리오에 사이드 프로젝트도 넣어도 되나요?"],
-            "current_topic":   "프리랜서 단가 인상",
-            "context_summary": "단가 인상은 JSS 90% 이상, 리뷰 5개 달성 시점이 적기다.",
-        },
-        {
-            "_desc": "케이스5: 마무리 — 클로징 멘트 예상 + Outro 판단 예상",
-            "messages":        [HumanMessage(content="오늘 방송 여기서 마무리할게요. 감사합니다.")],
-            "silence_duration": 2.0,
-            "question_queue":  [],
-            "current_topic":   "작업 견적 산정",
-            "context_summary": "작업 견적은 실제 시간에 커뮤니케이션·수정·버퍼를 더해 1.5배 곱하는 것이 현실적이다. 단가 인상은 JSS 90% 이상 시점이 적기다.",
-        },
-    ]
-
-    for case in CASES:
-        desc = case.pop("_desc")
-        print(f"\n{'='*60}")
-        print(f"  {desc}")
-        print('='*60)
-        # BASE(setup 초기값) 위에 케이스별 override 병합
-        state = {**BASE, **case}
-        state["cleaned_text"] = ""
-        state["retrieved_info"] = []
-        state["intent"] = ""
-        state["mc_script"] = ""
-
-        print("\n--- [1] preprocess ---")
-        state.update(preprocess_node(state))
-
-        print("\n--- [2] search ---")
-        state.update(knowledge_search_node(state))
-
-        print("\n--- [3] analyze_write ---")
-        state.update(analyze_write_node(state))
-
-        print("\n--- [4] decision ---")
-        print("결과:", decision_node(state))
