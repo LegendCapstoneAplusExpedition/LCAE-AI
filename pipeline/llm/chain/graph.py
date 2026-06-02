@@ -33,6 +33,7 @@ workflow.add_conditional_edges(
         "summarize": "summarize_listenlist",
         "question":  "generate_question",
         "analyze":   "analyze_write",
+        "wait":      END,
     }
 )
 

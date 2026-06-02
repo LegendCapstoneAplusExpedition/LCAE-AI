@@ -15,10 +15,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-load_dotenv(".env.local", override=True)
+_BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(_BASE_DIR / ".env")
+load_dotenv(_BASE_DIR / ".env.local", override=True)
 
-_LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
+_LISTENLIST_DIR = _BASE_DIR / "pipeline" / "listenlist"
 
 
 def _clear_session_files() -> None:

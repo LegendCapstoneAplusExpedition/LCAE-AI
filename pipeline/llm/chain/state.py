@@ -30,6 +30,9 @@ class AgentState(TypedDict):
     mc_script: str       # analyze_write_node가 생성한 MC 멘트 (output_node에서 messages로 이동)
     pending_question: str # 현재 전달/대기 중인 청취자 질문 텍스트
 
+    # 발화 페이싱 (진행자가 무지성으로 떠들지 않도록 제어)
+    last_ai_speech_ts: float   # AI가 마지막으로 발화한 시각(time.time()). 쿨다운 계산용
+
 # 분석+작성 통합 구조화 출력 스키마 (LLM 1회 호출로 분석과 멘트 생성을 동시에 처리)
 class AnalyzeAndWriteResult(BaseModel):
     topic:     str = Field(description="현재 대화의 핵심 키워드나 주제 (명사구 2~5단어)")

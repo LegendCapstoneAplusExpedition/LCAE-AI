@@ -15,4 +15,5 @@ def mentor_setup(topics: list[str]) -> AgentState:
         "cleaned_text":       "",
         "mc_script":          "",
         "pending_question":   "",
+        "last_ai_speech_ts":  0.0,
     }
