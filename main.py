@@ -15,8 +15,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-load_dotenv(".env.local", override=True)
+_BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(_BASE_DIR / ".env")
+load_dotenv(_BASE_DIR / ".env.local", override=True)
 
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore

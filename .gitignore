@@ -48,6 +48,10 @@ huggingface/
 tmp/
 logs/
 
+# 방송 런타임 버퍼
+pipeline/listenlist/*.jsonl
+pipeline/listenlist/ready_*.json
+
 # 오디오 테스트 파일
 *.wav
 *.mp3
@@ -72,6 +76,7 @@ data/chroma_db/
 
 # LLM 학습
 merged_model/
+merged_model_*/
 adapters/
 adapters_v2/
 adapters_*/

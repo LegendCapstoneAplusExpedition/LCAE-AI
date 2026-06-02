@@ -7,13 +7,78 @@ from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
 from pipeline.listenlist.paths import ready_summary_path, ready_question_path
 import re
 import time
+from difflib import SequenceMatcher
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
 _QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있어요|들어왔)|다음\s*질문|궁금한\s*거)')
 
+import os as _os
+
+# 진행자 브릿지 멘트 발화 쿨다운(초). 이 시간 안에는 설명/질문에 다시 끼어들지 않음.
+_BRIDGE_COOLDOWN_S = float(_os.getenv("AI_BRIDGE_COOLDOWN_S", "25"))
+
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
+
+def _normalize_intent(intent: str) -> str:
+    labels = ("질문요청", "정리요청", "마무리", "설명", "질문", "대기")
+    raw = (intent or "").strip()
+    if raw in labels:
+        return raw
+    for label in labels:
+        if label in raw:
+            return label
+    return "대기"
+
+def _is_echo_script(mc_script: str, mentor_text: str) -> bool:
+    script = (mc_script or "").strip()
+    source = (mentor_text or "").strip()
+    if not script or not source:
+        return False
+    if script in source or source in script:
+        return True
+    return SequenceMatcher(None, script, source).ratio() >= 0.82
+
+def _is_low_quality_bridge(mc_script: str) -> bool:
+    script = (mc_script or "").strip()
+    if not script:
+        return True
+    generic_phrases = (
+        "현재 주제",
+        "계속 진행",
+        "논의하겠습니다",
+        "이야기를 들어보겠습니다",
+        "주요 요소",
+        "강화하는 방법",
+        "방향으로 개선",
+        "알아보겠습니다",
+        "중요합니다",
+        "더 중요합니다",
+    )
+    if any(phrase in script for phrase in generic_phrases):
+        return True
+    words = set(_WORD_CHARS.findall(script))
+    if len(words) < 8:
+        return True
+    return len(_WORD_CHARS.findall(script)) < 8
+
+def _curated_bridge(mentor_text: str) -> str:
+    text = mentor_text or ""
+    rules = [
+        (("반응", "늦", "경험"), "결국 속도도 UX의 일부라는 말이네요."),
+        (("속도", "UX"), "결국 속도도 UX의 일부라는 말이네요."),
+        (("MVP", "핵심"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
+        (("MVP", "검증"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
+        (("커뮤니케이션", "공유"), "공유 방식이 성패를 가르는 지점이네요."),
+        (("역할", "커뮤니케이션"), "공유 방식이 성패를 가르는 지점이네요."),
+        (("피드백", "개선"), "피드백을 다음 개선으로 잇는 흐름입니다."),
+        (("사용자", "흐름"), "사용자 흐름을 기준으로 보자는 얘기네요."),
+    ]
+    for keywords, bridge in rules:
+        if all(keyword in text for keyword in keywords):
+            return bridge
+    return ""
 
 
 # ──────────────────────────────────────────────
@@ -27,6 +92,14 @@ def fast_intent_check(state: AgentState) -> str:
     if _QUESTION_REQ_RE.search(cleaned):
         print(f"[FastCheck] 질문요청 감지 → pre-computed 질문 즉시 반환")
         return "question"
+    if len(_WORD_CHARS.findall(cleaned)) < 5:
+        print("[FastCheck] short/filler utterance -> skip LLM")
+        return "wait"
+    stage = state.get("streaming_stage", "Main")
+    elapsed = time.time() - state.get("last_ai_speech_ts", 0.0)
+    if stage == "Main" and elapsed < _BRIDGE_COOLDOWN_S:
+        print(f"[FastCheck] bridge cooldown {elapsed:.0f}/{_BRIDGE_COOLDOWN_S:.0f}s -> skip LLM")
+        return "wait"
     return "analyze"
 
 
@@ -82,7 +155,6 @@ def analyze_write_node(state: AgentState):
     last_message = cleaned if cleaned else state["messages"][-1].content
     prev_summary = state.get("context_summary", "")
     stage        = state.get("streaming_stage", "Main")
-    question_queue = state.get("question_queue", [])
     knowledge    = "\n".join(state.get("retrieved_info", []))
 
     # 유효 글자(한글·영문·숫자) 5자 미만 → 필러/추임새, LLM 스킵
@@ -100,18 +172,35 @@ def analyze_write_node(state: AgentState):
     current_topic    = state.get("current_topic", "")
     topics_sec  = f"[방송 주제]: {', '.join(broadcast_topics)}" if broadcast_topics else ""
     current_sec = f"[현재 주제]: {current_topic}" if current_topic else ""
-    q_list        = "\n".join(f"- {q}" for q in question_queue) if question_queue else "없음"
     knowledge_sec = f"\n[검색된 참고 지식]:\n{knowledge}" if knowledge else ""
 
     prompt = f"""{topics_sec}
 {current_sec}
 [이전 단계]: {stage}
-[대기 질문]: {q_list}{knowledge_sec}
+{knowledge_sec}
 [멘토 발화]: "{last_message}"
 
+역할: 방송 흐름을 방해하지 않는 보조 MC.
+원칙:
+- 진행자의 말을 반복하거나 요약만 하지 마세요.
+- "현재 주제", "계속 진행", "논의하겠습니다" 같은 빈 진행 멘트는 금지.
+- 새 정보나 자연스러운 전환점이 없으면 intent는 "대기", mc_script는 "".
+- 브릿지를 할 때만, 진행자 발화의 구체 키워드 1개를 짚고 다음 흐름을 열어주는 한 문장으로 작성.
+- mc_script는 35자 이내의 짧은 한국어 한 문장.
+
+좋은 브릿지 예시:
+- 반응이 늦으면 경험이 끊긴다 → "결국 속도도 UX의 일부라는 말이네요."
+- MVP는 핵심 기능 하나를 검증한다 → "핵심 기능 하나에 초점을 맞춰보겠습니다."
+- 역할 분담보다 커뮤니케이션이 중요하다 → "공유 방식이 성패를 가르는 지점이네요."
+- 피드백을 받으며 작은 단위로 개선한다 → "피드백을 다음 개선으로 잇는 흐름입니다."
+
+나쁜 브릿지 예시:
+- "현재 주제를 계속 진행하겠습니다."
+- "이 부분에 대해 논의하겠습니다."
+- 진행자 발화를 그대로 반복한 문장.
+
 반드시 아래 JSON 형식으로만 출력하세요.
-- mc_script: 문자열이어야 함.
-{{"topic": "...", "intent": "...", "mc_script": "..."}}
+{{"topic": "...", "intent": "설명|질문|질문요청|정리요청|마무리|대기", "mc_script": "..."}}
 """
 
     t0 = time.time()
@@ -126,18 +215,34 @@ def analyze_write_node(state: AgentState):
 
     elapsed = time.time() - t0
 
-    if result.intent == "마무리":
+    normalized_intent = _normalize_intent(result.intent)
+    mc_script = (result.mc_script or "").strip()
+    if _is_echo_script(mc_script, last_message):
+        print("[AnalyzeWrite] mc_script echoes mentor text -> clear")
+        mc_script = ""
+    elif _is_low_quality_bridge(mc_script):
+        print("[AnalyzeWrite] low-quality/generic bridge -> clear")
+        mc_script = ""
+    if not mc_script and normalized_intent in ("설명", "질문"):
+        curated = _curated_bridge(last_message)
+        if curated:
+            print("[AnalyzeWrite] curated bridge applied")
+            mc_script = curated
+    if normalized_intent == "대기":
+        mc_script = ""
+
+    if normalized_intent == "마무리":
         new_stage = "Outro"
-    elif result.intent == "질문요청":
+    elif normalized_intent == "질문요청":
         new_stage = "QnA"
-    elif stage == "QnA" and result.intent not in ("질문요청", "마무리"):
+    elif stage == "QnA" and normalized_intent not in ("질문요청", "마무리"):
         new_stage = "Main"
     else:
         new_stage = stage
 
     print(f"[AnalyzeWrite] 완료  ({elapsed:.2f}s)")
-    print(f"[AnalyzeWrite] topic={result.topic} | intent={result.intent} | stage={stage}→{new_stage}")
-    print(f"[AnalyzeWrite] mc_script: \"{result.mc_script[:80]}{'...' if len(result.mc_script) > 80 else ''}\"")
+    print(f"[AnalyzeWrite] topic={result.topic} | intent={normalized_intent} | stage={stage}→{new_stage}")
+    print(f"[AnalyzeWrite] mc_script: \"{mc_script[:80]}{'...' if len(mc_script) > 80 else ''}\"")
 
 
     try:
@@ -161,9 +266,9 @@ def analyze_write_node(state: AgentState):
 
     return {
         "current_topic":   result.topic,
-        "intent":          result.intent,
+        "intent":          normalized_intent,
         "streaming_stage": new_stage,
-        "mc_script":       result.mc_script,
+        "mc_script":       mc_script,
     }
 
 
@@ -173,11 +278,6 @@ def analyze_write_node(state: AgentState):
 def decision_node(state: AgentState) -> str:
     intent  = state.get("intent", "")
     stage   = state.get("streaming_stage", "Main")
-    pending = state.get("pending_question", "")
-
-    if stage == "Outro" and intent == "마무리":
-        print(f"[Decision] Outro 진입 완료 → 추가 클로징 차단")
-        return "wait"
 
     if intent == "정리요청":
         print(f"[Decision] intent=\"{intent}\" → summarize")
@@ -187,10 +287,27 @@ def decision_node(state: AgentState) -> str:
         print(f"[Decision] intent=\"{intent}\" → ask_question")
         return "ask_question"
 
-    should_speak = intent == "마무리"
-    decision = "speak" if should_speak else "wait"
-    print(f"[Decision] intent=\"{intent}\" → {decision}")
-    return decision
+    # 마무리는 항상 발화
+    if intent == "마무리":
+        print(f"[Decision] intent=\"{intent}\" → speak")
+        return "speak"
+
+    # 설명·질문: 진행자 브릿지 멘트가 있으면 발화하되, 쿨다운으로 페이싱.
+    # (멘토가 말할 때마다 끼어들지 않고, 마지막 발화 후 일정 시간 경과 시에만 반응)
+    if intent in ("설명", "질문"):
+        mc = state.get("mc_script", "").strip()
+        if not mc:
+            print(f"[Decision] intent=\"{intent}\" → wait (브릿지 멘트 없음)")
+            return "wait"
+        elapsed = time.time() - state.get("last_ai_speech_ts", 0.0)
+        if elapsed >= _BRIDGE_COOLDOWN_S:
+            print(f"[Decision] intent=\"{intent}\" → speak (쿨다운 경과 {elapsed:.0f}s)")
+            return "speak"
+        print(f"[Decision] intent=\"{intent}\" → wait (쿨다운 {elapsed:.0f}/{_BRIDGE_COOLDOWN_S:.0f}s)")
+        return "wait"
+
+    print(f"[Decision] intent=\"{intent}\" → wait")
+    return "wait"
 
 
 # ──────────────────────────────────────────────
@@ -207,9 +324,6 @@ def summarize_listenlist_node(state: AgentState):
             summary = data.get("summary", "").strip()
         except Exception:
             pass
-
-    if not summary:
-        summary = state.get("context_summary", "").strip()
 
     if not summary:
         print("[Summarize] 요약 없음")
@@ -244,7 +358,10 @@ def generate_question_node(state: AgentState):
     mc_script = f"{username}님 질문입니다. {question}" if username else question
 
     print(f"[GenerateQuestion] 질문 가져옴 ({(time.time()-t0)*1000:.1f}ms): {question}")
-    return {"mc_script": mc_script}
+    return {
+        "mc_script": mc_script,
+        "pending_question": question,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -260,82 +377,5 @@ def output_node(state: AgentState):
     print(f"[Output] 최종 멘트: \"{mc_script}\"")
     return {
         "messages": [AIMessage(content=mc_script)],
+        "last_ai_speech_ts": time.time(),  # 쿨다운 기준 시각 갱신
     }
-
-
-if __name__ == "__main__":
-    from langchain_core.messages import HumanMessage
-    from pipeline.llm.chain.setup import mentor_setup
-
-    # 방송 전: 멘토가 주제 키워드 사전 입력
-    BASE = mentor_setup(["주니어-시니어 성장", "번아웃 예방", "MVP 전략", "프리랜서 단가"])
-    print(f"[Setup] broadcast_topics={BASE['broadcast_topics']}")
-    print(f"[Setup] current_topic={BASE['current_topic']} | streaming_stage={BASE['streaming_stage']}")
-
-    CASES = [
-        # streaming_stage 없음 — LLM이 발화 맥락만 보고 스스로 판단
-        {
-            "_desc": "케이스1: 짧은 filler (대기 예상)",
-            "messages":        [HumanMessage(content="음... 그러니까 그게 말이죠.")],
-            "silence_duration": 1.0,
-            "question_queue":  [],
-            "current_topic":   "주니어-시니어 성장",
-            "context_summary": "시니어는 기술 스택보다 문제 정의 능력이 중요하다.",
-        },
-        {
-            "_desc": "케이스2: 실질 내용 발화 (브릿지 멘트 예상)",
-            "messages":        [HumanMessage(content="번아웃은 시간 관리 실패가 아니라 의미를 잃었을 때 생겨요. 작은 완성 경험을 쌓는 게 핵심이에요.")],
-            "silence_duration": 3.5,
-            "question_queue":  [],
-            "current_topic":   "번아웃 예방 전략",
-            "context_summary": "하루를 집중 블록과 커뮤니케이션 블록으로 나누는 것이 효과적이다.",
-        },
-        {
-            "_desc": "케이스3: 정리요청 — 누적 요약 읽기 예상",
-            "messages":        [HumanMessage(content="지금까지 내용 정리해주세요.")],
-            "silence_duration": 2.0,
-            "question_queue":  [],
-            "current_topic":   "MVP 최소 기능 정의",
-            "context_summary": "사이드 프로젝트는 고객 인터뷰 5개로 수요 검증 후 시작해야 한다. MVP는 핵심 기능 하나로 빠르게 출시하는 것이 효율적이다.",
-        },
-        {
-            "_desc": "케이스4: 질문요청 — 대기 질문 전달 예상",
-            "messages":        [HumanMessage(content="잠깐 질문 받을게요.")],
-            "silence_duration": 2.0,
-            "question_queue":  ["단가 인상은 언제 하는 게 좋나요?", "포트폴리오에 사이드 프로젝트도 넣어도 되나요?"],
-            "current_topic":   "프리랜서 단가 인상",
-            "context_summary": "단가 인상은 JSS 90% 이상, 리뷰 5개 달성 시점이 적기다.",
-        },
-        {
-            "_desc": "케이스5: 마무리 — 클로징 멘트 예상 + Outro 판단 예상",
-            "messages":        [HumanMessage(content="오늘 방송 여기서 마무리할게요. 감사합니다.")],
-            "silence_duration": 2.0,
-            "question_queue":  [],
-            "current_topic":   "작업 견적 산정",
-            "context_summary": "작업 견적은 실제 시간에 커뮤니케이션·수정·버퍼를 더해 1.5배 곱하는 것이 현실적이다. 단가 인상은 JSS 90% 이상 시점이 적기다.",
-        },
-    ]
-
-    for case in CASES:
-        desc = case.pop("_desc")
-        print(f"\n{'='*60}")
-        print(f"  {desc}")
-        print('='*60)
-        # BASE(setup 초기값) 위에 케이스별 override 병합
-        state = {**BASE, **case}
-        state["cleaned_text"] = ""
-        state["retrieved_info"] = []
-        state["intent"] = ""
-        state["mc_script"] = ""
-
-        print("\n--- [1] preprocess ---")
-        state.update(preprocess_node(state))
-
-        print("\n--- [2] search ---")
-        state.update(knowledge_search_node(state))
-
-        print("\n--- [3] analyze_write ---")
-        state.update(analyze_write_node(state))
-
-        print("\n--- [4] decision ---")
-        print("결과:", decision_node(state))

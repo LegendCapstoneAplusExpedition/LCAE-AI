@@ -131,11 +131,11 @@ class WhisperTranscriber:
         compute_type = config.compute_type
 
         # device/compute_type 자동 설정
-        if device == "auto": 
+        if device == "auto":
             try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
+                import ctranslate2
+                device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+            except Exception:
                 device = "cpu"
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
@@ -255,9 +255,11 @@ class ASRCore:
         self,
         config: PipelineConfig,
         on_transcription: Callable[[TranscriptionResult], None],
+        on_speech_start: Optional[Callable[[], None]] = None,
     ):
         self.config = config
         self.on_transcription = on_transcription
+        self.on_speech_start = on_speech_start  # 음성 시작 감지 시 호출 (바지인 인터럽트용)
         self.transcriber = WhisperTranscriber(config)
         self.vad = SileroVAD(sample_rate=config.sample_rate, threshold=config.vad_threshold)
         self.buffer = SpeechBuffer(config=config)
@@ -281,6 +283,15 @@ class ASRCore:
         )
         self._transcribe_worker.start()
         self._downstream_worker.start()
+        # 바지인 인터럽트 페이싱: 단발성 노이즈에 끊기지 않도록
+        # 누적 발화 길이(BARGE_IN_MIN_SPEECH_MS) 이상일 때만 발화 구간당 1회 트리거.
+        # VAD가 발화 중에도 깜빡일 수 있으므로 짧은 공백은 무시하고,
+        # silence_chunks 만큼 공백이 이어져 발화 구간이 끝났을 때만 리셋한다.
+        _min_ms = float(_env("BARGE_IN_MIN_SPEECH_MS", "350"))
+        self._barge_min_chunks = max(1, int(_min_ms / config.chunk_duration_ms))
+        self._speech_run = 0       # 현재 구간 누적 발화 청크 수
+        self._gap_run = 0          # 연속 비음성 청크 수
+        self._barge_fired = False  # 현재 발화 구간에서 이미 트리거했는지
 
     def push(self, chunk: np.ndarray):
         """float32 PCM 청크 1개를 입력. 발화 완성 시 전사 대기열에 적재 (논블로킹)."""
@@ -288,6 +299,27 @@ class ASRCore:
         is_speech = self.vad.is_speech(chunk)
         if is_speech and not was_speaking:
             print("\n[VAD] 음성 감지됨! (Speech Started)", flush=True)
+
+        # 보수적 바지인 트리거
+        if is_speech:
+            self._speech_run += 1
+            self._gap_run = 0
+            if (not self._barge_fired
+                    and self._speech_run >= self._barge_min_chunks
+                    and self.on_speech_start):
+                self._barge_fired = True
+                print(f"[VAD] 바지인 트리거 (연속 발화 {self._speech_run * self.config.chunk_duration_ms}ms)", flush=True)
+                try:
+                    self.on_speech_start()
+                except Exception:
+                    pass
+        else:
+            self._gap_run += 1
+            # 발화 구간이 실제로 끝났을 때(공백이 충분히 길 때)만 리셋
+            if self._gap_run >= self.config.silence_chunks:
+                self._speech_run = 0
+                self._barge_fired = False
+
         audio = self.buffer.push(chunk, is_speech)
         if audio is not None:
             backlog = self._audio_queue.qsize()
@@ -451,9 +483,19 @@ class RealtimeASRServer:
                 else:
                     self.on_transcription(result, websocket)
 
+        # 바지인: 멘토 음성이 감지되면 백엔드에 인터럽트 신호를 보내 TTS를 끊게 함
+        def notify_speech_start():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send(json.dumps({"type": "interrupt"})), loop
+                )
+            except Exception:
+                pass
+
         core = ASRCore(
             self.config,
             on_transcription=callback_with_ws,
+            on_speech_start=notify_speech_start,
         )
 
         chunk_count = 0
