@@ -1,0 +1,15 @@
+# Local SFT + merge environment
+#
+# Install PyTorch with the CUDA wheel that matches the friend's machine first,
+# then install this file. Example for CUDA 12.4:
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch torchaudio
+#   pip install -r llm_training/requirements.txt
+
+transformers>=4.45.0
+trl==1.5.1
+peft>=0.13.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.0
+datasets>=2.20.0
+safetensors>=0.4.3
+huggingface_hub>=0.24.0
