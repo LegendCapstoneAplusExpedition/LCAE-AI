@@ -48,6 +48,7 @@ huggingface-cli login
 python llm_training/scripts/train.py --validate-only
 python llm_training/scripts/train.py
 python llm_training/scripts/merge.py --smoke-test
+python llm_training/scripts/gguf.py
 ```
 
 특정 기능만 골라 학습/검증할 수도 있습니다.
@@ -61,6 +62,7 @@ python llm_training/scripts/train.py --tasks summary,question
 
 - LoRA adapter: `llm_training/adapters_v3/`
 - Merged model: `llm_training/merged_model_v3/`
+- Q4 GGUF: `llm_training/gguf/driving-mentor-v3-q4_k_m.gguf`
 
 OOM이 나면 아래처럼 줄입니다.
 
