@@ -18,7 +18,7 @@ import re
 import threading
 from pathlib import Path
 
-_DEFAULT_PATH = Path(__file__).parent / "chat.jsonl"
+from pipeline.listenlist.paths import chat_path
 
 _QUESTION_RE = re.compile(
     r"(\?|？|질문|궁금|어떻게|왜|뭐|무엇|언제|어디|누구|가능한가|될까요|인가요|나요|까요|알려주세요)"
@@ -26,8 +26,10 @@ _QUESTION_RE = re.compile(
 
 
 class ChatList:
-    def __init__(self, path: Path = _DEFAULT_PATH):
-        self.path = Path(path)
+    def __init__(self, broadcast_id: str | None = None, path: Path | None = None):
+        # broadcast_id로 세션별 chat.jsonl 경로를 결정한다 (Node 백엔드와 동일 위치).
+        self.broadcast_id = broadcast_id
+        self.path = Path(path) if path is not None else chat_path(broadcast_id)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 

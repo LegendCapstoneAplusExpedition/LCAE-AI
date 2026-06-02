@@ -82,3 +82,6 @@ Modelfile_q4
 
 # 테스트
 test_outputs/
+
+# 방송 세션 런타임 데이터 (방송별 listenlist 파일 — 동시 방송 격리용)
+pipeline/listenlist/sessions/

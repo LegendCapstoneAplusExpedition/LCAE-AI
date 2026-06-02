@@ -16,15 +16,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-_DEFAULT_PATH    = Path(__file__).parent / "transcriptions.jsonl"
-_READY_SUMMARY_PATH = Path(__file__).parent / "ready_summary.json"
+from pipeline.listenlist.paths import transcriptions_path, ready_summary_path
 
 SUMMARY_INTERVAL = 5  # 전사 N개마다 백그라운드 요약 갱신
 
 
 class ListenList:
-    def __init__(self, path: Path = _DEFAULT_PATH):
-        self.path = Path(path)
+    def __init__(self, broadcast_id: str | None = None, path: Path | None = None):
+        # broadcast_id로 세션별 파일 경로를 결정한다 (동시 방송 격리).
+        self.broadcast_id = broadcast_id
+        self.path = Path(path) if path is not None else transcriptions_path(broadcast_id)
+        self._ready_summary_path = ready_summary_path(broadcast_id)
         self._lock = threading.Lock()
         self._summarizing = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +82,7 @@ class ListenList:
             result = llm.invoke([HumanMessage(content=prompt)])
             summary = result.content.strip()
 
-            _READY_SUMMARY_PATH.write_text(
+            self._ready_summary_path.write_text(
                 json.dumps(
                     {"time": time.strftime("%H:%M:%S"), "summary": summary},
                     ensure_ascii=False,

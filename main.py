@@ -18,32 +18,38 @@ from dotenv import load_dotenv
 load_dotenv()
 load_dotenv(".env.local", override=True)
 
-_LISTENLIST_DIR = Path(__file__).parent / "pipeline" / "listenlist"
-
-
-def _clear_session_files() -> None:
-    _LISTENLIST_DIR.mkdir(parents=True, exist_ok=True)
-    for fname in ("transcriptions.jsonl", "chat.jsonl", "ai_outputs.jsonl", "ready_summary.json", "ready_question.json"):
-        fpath = _LISTENLIST_DIR / fname
-        fpath.write_text("", encoding="utf-8")
-        print(f"[시작] {fname} 초기화 완료")
-
 from pipeline.stt import MicrophoneASRTest, PipelineConfig, TranscriptionResult
 from pipeline.tts import SynthesisResult, TTSConfig, TTSCore
 from pipeline.listenlist import AIOutputList, ListenList
+from pipeline.listenlist import paths as listen_paths
 
 
-def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None, on_synthesis=None):
-    """STT → LLM → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다."""
+def _clear_session_files(broadcast_id: str = "") -> None:
+    """해당 방송 세션 디렉터리의 상태 파일을 초기화한다 (동시 방송 격리)."""
+    session = listen_paths.session_dir(broadcast_id)
+    for fname in listen_paths.SESSION_FILES:
+        fpath = session / fname
+        fpath.write_text("", encoding="utf-8")
+        print(f"[시작] {fname} 초기화 완료 (session={session.name})")
+
+
+def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: list[str] | None = None, on_synthesis=None, broadcast_id: str = ""):
+    """STT → LLM → TTS 파이프라인을 조립하여 on_transcription 콜백을 반환합니다.
+
+    broadcast_id로 state/listen_list/ai_outputs의 파일 경로를 세션별로 격리하므로
+    여러 방송을 동시에 처리해도 서로의 상태를 침범하지 않는다.
+    """
     from pipeline.llm.chain.setup import mentor_setup
     from pipeline.llm.chain.graph import app as llm_app
     from langchain_core.messages import HumanMessage, AIMessage
 
+    bid = broadcast_id or os.getenv("BROADCAST_ID", "")
+
     tts = TTSCore(tts_config, on_synthesis=on_synthesis or _on_synthesis)
-    # 방송 세션 상태 — 호출 간 누적됨 (topics 기반으로 초기화)
-    state = mentor_setup(topics or [])
-    listen_list = ListenList()
-    ai_outputs = AIOutputList()
+    # 방송 세션 상태 — 호출 간 누적됨 (topics + broadcast_id 기반으로 초기화)
+    state = mentor_setup(topics or [], broadcast_id=bid)
+    listen_list = ListenList(broadcast_id=bid)
+    ai_outputs = AIOutputList(broadcast_id=bid)
     min_llm_confidence = float(os.getenv("ASR_MIN_LLM_CONFIDENCE", "0.55"))
 
     def on_transcription(result: TranscriptionResult) -> None:
@@ -125,7 +131,10 @@ def _on_synthesis(result: SynthesisResult) -> None:
 def main() -> None:
     import argparse
 
-    _clear_session_files()
+    # 이 프로세스가 담당할 방송 세션 ID (Node 백엔드가 BROADCAST_ID env로 주입).
+    # 동시 방송은 각자 별도 프로세스 + 별도 세션 디렉터리로 격리된다.
+    broadcast_id = os.getenv("BROADCAST_ID", "")
+    _clear_session_files(broadcast_id)
 
     parser = argparse.ArgumentParser(description="Capstone2026-1 통합 파이프라인")
     parser.add_argument("--mode", choices=["mic", "server", "client"], default="mic",
@@ -174,7 +183,7 @@ def main() -> None:
         print(f"[시작] 방송 주제 전달: {topics[0]}")
 
     if args.mode == "mic":
-        on_transcription = build_pipeline(stt_config, tts_config, topics=topics)
+        on_transcription = build_pipeline(stt_config, tts_config, topics=topics, broadcast_id=broadcast_id)
         test = MicrophoneASRTest(stt_config, on_transcription=on_transcription)
         test.run(device=args.mic_device)
 
@@ -182,26 +191,29 @@ def main() -> None:
         import asyncio
         from pipeline.stt import RealtimeASRServer
 
-        _ctx: dict = {"ws": None, "loop": None}
+        def make_session(websocket):
+            """연결마다 독립된 STT→LLM→TTS 파이프라인을 생성한다.
 
-        def on_synthesis_server(result: SynthesisResult) -> None:
-            ws = _ctx["ws"]
-            loop = _ctx["loop"]
-            if ws is not None and loop is not None and loop.is_running():
-                asyncio.run_coroutine_threadsafe(ws.send(result["audio"]), loop)
+            state/listen_list/ai_outputs/TTS가 연결별로 격리되고, TTS 출력도
+            해당 websocket에 고정 바인딩되므로 동시 접속 시 상태 경합이나
+            오디오 오전송이 발생하지 않는다.
+            """
+            loop = asyncio.get_running_loop()
 
-        on_transcription = build_pipeline(stt_config, tts_config, topics=topics, on_synthesis=on_synthesis_server)
+            def on_synthesis_server(result: SynthesisResult) -> None:
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(websocket.send(result["audio"]), loop)
 
-        def on_transcription_with_ws(result, websocket) -> None:
-            _ctx["ws"] = websocket
-            on_transcription(result)
+            return build_pipeline(
+                stt_config, tts_config, topics=topics,
+                on_synthesis=on_synthesis_server, broadcast_id=broadcast_id,
+            )
 
         async def run_server():
-            _ctx["loop"] = asyncio.get_running_loop()
             server = RealtimeASRServer(
                 host=args.host, port=args.port,
                 config=stt_config,
-                on_transcription=on_transcription_with_ws,
+                session_factory=make_session,
             )
             await server.serve()
 
@@ -210,7 +222,7 @@ def main() -> None:
     elif args.mode == "client":
         import asyncio
         from pipeline.stt import RealtimeASRPipeline
-        on_transcription = build_pipeline(stt_config, tts_config, topics=topics)
+        on_transcription = build_pipeline(stt_config, tts_config, topics=topics, broadcast_id=broadcast_id)
         client = RealtimeASRPipeline(config=stt_config, on_transcription=on_transcription)
         try:
             asyncio.run(client.run())

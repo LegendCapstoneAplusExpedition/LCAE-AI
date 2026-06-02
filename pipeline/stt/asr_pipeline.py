@@ -12,6 +12,7 @@ import asyncio
 import json
 import math
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -261,22 +262,77 @@ class ASRCore:
         self.vad = SileroVAD(sample_rate=config.sample_rate, threshold=config.vad_threshold)
         self.buffer = SpeechBuffer(config=config)
 
+        # ── 동시성 모델 ──────────────────────────────────────────────────────
+        # 발화마다 새 스레드를 띄우면 (1) thread-safe하지 않은 Whisper 모델을
+        # 동시 호출해 교착되고, (2) 다운스트림(LLM 그래프 + TTS)이 공유 state를
+        # 경합하며 전사가 중간에 멈춘다.
+        # 따라서 두 단계를 각각 "단일 워커 스레드"로 직렬화한다.
+        #   - 전사 워커: Whisper 호출을 한 스레드에서만 → thread-safe 보장
+        #   - 후처리 워커: 느린 LLM/TTS를 전사와 분리 → 전사가 막히지 않음
+        self._audio_queue: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
+        self._result_queue: "queue.Queue[Optional[TranscriptionResult]]" = queue.Queue()
+        self._closed = False
+
+        self._transcribe_worker = threading.Thread(
+            target=self._transcribe_loop, daemon=True, name="asr-transcribe"
+        )
+        self._downstream_worker = threading.Thread(
+            target=self._downstream_loop, daemon=True, name="asr-downstream"
+        )
+        self._transcribe_worker.start()
+        self._downstream_worker.start()
+
     def push(self, chunk: np.ndarray):
-        """float32 PCM 청크 1개를 입력. 발화 완성 시 콜백 호출 (별도 스레드에서)."""
+        """float32 PCM 청크 1개를 입력. 발화 완성 시 전사 대기열에 적재 (논블로킹)."""
         was_speaking = self.buffer._is_speaking
         is_speech = self.vad.is_speech(chunk)
         if is_speech and not was_speaking:
             print("\n[VAD] 음성 감지됨! (Speech Started)", flush=True)
         audio = self.buffer.push(chunk, is_speech)
         if audio is not None:
-            print(f"[VAD] 발화 종료 → 전사 시작 ({len(audio) / self.config.sample_rate:.2f}s)", flush=True)
-            t = threading.Thread(target=self._transcribe, args=(audio,), daemon=True)
-            t.start()
+            backlog = self._audio_queue.qsize()
+            print(
+                f"[VAD] 발화 종료 → 전사 대기열 적재 "
+                f"({len(audio) / self.config.sample_rate:.2f}s, 대기 {backlog}건)",
+                flush=True,
+            )
+            self._audio_queue.put(audio)
 
-    def _transcribe(self, audio: np.ndarray):
-        result = self.transcriber.transcribe(audio)
-        if result["text"].strip():
-            self.on_transcription(result)
+    def _transcribe_loop(self):
+        """전사 전용 워커 — Whisper 모델을 단일 스레드에서만 호출한다."""
+        while True:
+            audio = self._audio_queue.get()
+            try:
+                if audio is None:  # 종료 신호
+                    break
+                result = self.transcriber.transcribe(audio)
+                if result["text"].strip():
+                    self._result_queue.put(result)
+            except Exception as e:
+                print(f"[ASR] 전사 오류: {e}", flush=True)
+            finally:
+                self._audio_queue.task_done()
+
+    def _downstream_loop(self):
+        """후처리 전용 워커 — LLM 그래프/TTS(느린 작업)를 단일 스레드에서 순차 실행한다."""
+        while True:
+            result = self._result_queue.get()
+            try:
+                if result is None:  # 종료 신호
+                    break
+                self.on_transcription(result)
+            except Exception as e:
+                print(f"[ASR] 후처리(LLM/TTS) 오류: {e}", flush=True)
+            finally:
+                self._result_queue.task_done()
+
+    def close(self):
+        """워커 스레드를 정리한다. (연결 종료/테스트 종료 시 호출)"""
+        if self._closed:
+            return
+        self._closed = True
+        self._audio_queue.put(None)
+        self._result_queue.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +418,15 @@ class RealtimeASRServer:
         port: int = 8765,
         config: Optional[PipelineConfig] = None,
         on_transcription: Optional[Callable[[TranscriptionResult, Optional[websockets.WebSocketServerProtocol]], None]] = None,
+        session_factory: Optional[Callable[[websockets.WebSocketServerProtocol], Callable[[TranscriptionResult], None]]] = None,
     ):
         self.host = host
         self.port = port
         self.config = config or PipelineConfig()
+        # session_factory(websocket) -> on_transcription(result)
+        #   연결마다 독립 파이프라인(state/listen_list/TTS)을 생성해 동시 접속 시
+        #   상태 경합을 원천 차단한다. 지정하면 on_transcription보다 우선한다.
+        self.session_factory = session_factory
         self.on_transcription = on_transcription or (
             lambda r, ws: print(f"[ASR] {r['text']} (confidence={r['confidence']:.3f})")
         )
@@ -374,13 +435,21 @@ class RealtimeASRServer:
         print(f"[Server] 클라이언트 연결됨: {websocket.remote_address}")
 
         loop = asyncio.get_event_loop()
-        
-        # wrap the callback to include the websocket
-        def callback_with_ws(result: TranscriptionResult):
-            if asyncio.iscoroutinefunction(self.on_transcription):
-                asyncio.run_coroutine_threadsafe(self.on_transcription(result, websocket), loop)
-            else:
-                self.on_transcription(result, websocket)
+
+        # 연결별 콜백 구성
+        if self.session_factory is not None:
+            # 이 연결만을 위한 독립 파이프라인 (state/listen_list/TTS 격리)
+            session_on_transcription = self.session_factory(websocket)
+
+            def callback_with_ws(result: TranscriptionResult):
+                session_on_transcription(result)
+        else:
+            # 레거시: 단일 공유 콜백 (result, websocket) 시그니처
+            def callback_with_ws(result: TranscriptionResult):
+                if asyncio.iscoroutinefunction(self.on_transcription):
+                    asyncio.run_coroutine_threadsafe(self.on_transcription(result, websocket), loop)
+                else:
+                    self.on_transcription(result, websocket)
 
         core = ASRCore(
             self.config,
@@ -415,6 +484,8 @@ class RealtimeASRServer:
                     await loop.run_in_executor(None, core.push, chunk)
         except websockets.exceptions.ConnectionClosed:
             pass
+        finally:
+            core.close()  # 워커 스레드 누수 방지
 
         print(f"\n[Server] 클라이언트 연결 종료: {websocket.remote_address}")
 
@@ -549,6 +620,8 @@ class MicrophoneASRTest:
         except KeyboardInterrupt:
             print("\n\n[MicTest] 종료 요청.")
         finally:
+            if self._core is not None:
+                self._core.close()
             self._print_summary()
 
     def stop(self):

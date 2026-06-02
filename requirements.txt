@@ -1,3 +1,7 @@
+﻿# CUDA 12.4 GPU 빌드(torch/torchaudio)를 받기 위한 인덱스.
+# GPU가 없다면 아래 torch/torchaudio 줄의 "+cu124"를 빼고 이 줄도 지우면 CPU 빌드가 설치됩니다.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
 # ── 공통 ──────────────────────────────────────────────────────────────────────
 numpy>=1.24.4
 python-dotenv>=1.2.2
@@ -14,8 +18,10 @@ gtts>=2.5.0
 pydub>=0.25.1            # MP3 → PCM 변환 (ffmpeg 필요)
 
 # ── GPU / Torch (STT Silero-VAD · TTS · sentence-transformers 공통) ─────────
-torch>=2.3.1
-torchaudio>=2.3.1
+# CPU 빌드가 깔리는 것을 막기 위해 cu124 GPU 빌드로 고정.
+# torch와 torchaudio 버전은 반드시 동일해야 함(ABI). cu124 채널 최신 호환쌍 = 2.6.0.
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
 
 # ── ASR Finetuning ────────────────────────────────────────────────────────────
 datasets

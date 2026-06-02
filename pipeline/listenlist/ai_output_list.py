@@ -9,12 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-_DEFAULT_PATH = Path(__file__).parent / "ai_outputs.jsonl"
+from pipeline.listenlist.paths import ai_outputs_path
 
 
 class AIOutputList:
-    def __init__(self, path: Path = _DEFAULT_PATH):
-        self.path = Path(path)
+    def __init__(self, broadcast_id: str | None = None, path: Path | None = None):
+        # broadcast_id로 세션별 파일 경로를 결정한다 (동시 방송 격리).
+        self.broadcast_id = broadcast_id
+        self.path = Path(path) if path is not None else ai_outputs_path(broadcast_id)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -29,7 +31,7 @@ class AIOutputList:
     ) -> dict:
         entry = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "broadcast_id": os.getenv("BROADCAST_ID", ""),
+            "broadcast_id": self.broadcast_id or os.getenv("BROADCAST_ID", ""),
             "mentor_text": mentor_text,
             "mentor_confidence": round(float(mentor_confidence), 4),
             "topic": state.get("current_topic", ""),

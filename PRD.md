@@ -105,7 +105,8 @@ STT 결과를 임시 저장하여 LLM이 이전 발화 컨텍스트를 참조할
 
 ### 3.4 핵심 파일
 - [pipeline/listenlist/listen_list.py](pipeline/listenlist/listen_list.py) — ListenList 클래스 (80 lines)
-- [pipeline/listenlist/transcriptions.jsonl](pipeline/listenlist/transcriptions.jsonl) — 런타임 버퍼 파일
+- [pipeline/listenlist/paths.py](pipeline/listenlist/paths.py) — 방송별 세션 파일 경로 리졸버 (동시 방송 격리)
+- `pipeline/listenlist/sessions/<broadcast_id>/transcriptions.jsonl` — 방송별 런타임 버퍼 파일
 
 ---
 

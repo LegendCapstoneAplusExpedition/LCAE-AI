@@ -17,6 +17,7 @@ class AgentState(TypedDict):
 
     # 방송 사전 설정 (mentor_setup에서 주입)
     broadcast_topics: List[str]      # 멘토가 사전에 입력한 주제 키워드 목록
+    broadcast_id: str                # 세션 식별자 — 동시 방송 시 파일 경로 격리에 사용
 
     # 방송 상태
     streaming_stage: str            # Main, QnA, Outro (Intro는 외부 화면 처리)

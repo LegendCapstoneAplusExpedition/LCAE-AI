@@ -1,19 +1,16 @@
 from langchain_core.messages import AIMessage
 from langchain_chroma import Chroma
-from pathlib import Path
 from pipeline.llm.utils.llm import llm_structured
 from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
+from pipeline.listenlist.paths import ready_summary_path, ready_question_path
 import re
 import time
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
 _QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있어요|들어왔)|다음\s*질문|궁금한\s*거)')
-
-_READY_SUMMARY_PATH  = Path(__file__).parent.parent.parent / "listenlist" / "ready_summary.json"
-_READY_QUESTION_PATH = Path(__file__).parent.parent.parent / "listenlist" / "ready_question.json"
 
 _vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 _db_has_data = _vector_db._collection.count() > 0
@@ -146,18 +143,19 @@ def analyze_write_node(state: AgentState):
     try:
         import json as _json, os as _os
         from pipeline.listenlist.chat_list import ChatList as _ChatList
-        broadcast_id = _os.getenv("BROADCAST_ID", "").strip() or None
-        next_q = _ChatList().peek_next_question(broadcast_id=broadcast_id)
+        broadcast_id = (state.get("broadcast_id") or _os.getenv("BROADCAST_ID", "")).strip() or None
+        ready_q_path = ready_question_path(broadcast_id)
+        next_q = _ChatList(broadcast_id=broadcast_id).peek_next_question(broadcast_id=broadcast_id)
         if next_q:
             question = next_q.get("message", "").strip()
             username = next_q.get("username", "").strip()
             mc_text = f"{username}님 질문입니다. {question}" if username else question
-            _READY_QUESTION_PATH.write_text(
+            ready_q_path.write_text(
                 _json.dumps({"time": time.strftime("%H:%M:%S"), "mc_text": mc_text}, ensure_ascii=False),
                 encoding="utf-8",
             )
-        elif _READY_QUESTION_PATH.exists():
-            _READY_QUESTION_PATH.unlink()
+        elif ready_q_path.exists():
+            ready_q_path.unlink()
     except Exception:
         pass
 
@@ -202,9 +200,10 @@ def summarize_listenlist_node(state: AgentState):
     import json as _json
 
     summary = ""
-    if _READY_SUMMARY_PATH.exists():
+    ready_s_path = ready_summary_path(state.get("broadcast_id") or None)
+    if ready_s_path.exists():
         try:
-            data = _json.loads(_READY_SUMMARY_PATH.read_text(encoding="utf-8"))
+            data = _json.loads(ready_s_path.read_text(encoding="utf-8"))
             summary = data.get("summary", "").strip()
         except Exception:
             pass
@@ -230,8 +229,8 @@ def generate_question_node(state: AgentState):
 
     t0 = time.time()
 
-    broadcast_id = os.getenv("BROADCAST_ID", "").strip() or None
-    chat_question = ChatList().pop_next_question(broadcast_id=broadcast_id)
+    broadcast_id = (state.get("broadcast_id") or os.getenv("BROADCAST_ID", "")).strip() or None
+    chat_question = ChatList(broadcast_id=broadcast_id).pop_next_question(broadcast_id=broadcast_id)
 
     if not chat_question:
         print(f"[GenerateQuestion] 대기 질문 없음 ({(time.time()-t0)*1000:.1f}ms)")
