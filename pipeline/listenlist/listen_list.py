@@ -19,7 +19,7 @@ from pathlib import Path
 _DEFAULT_PATH    = Path(__file__).parent / "transcriptions.jsonl"
 _READY_SUMMARY_PATH = Path(__file__).parent / "ready_summary.json"
 
-SUMMARY_INTERVAL = 5  # 전사 N개마다 백그라운드 요약 갱신
+SUMMARY_INTERVAL = 3  # 전사 N개마다 백그라운드 요약 갱신
 
 
 class ListenList:
