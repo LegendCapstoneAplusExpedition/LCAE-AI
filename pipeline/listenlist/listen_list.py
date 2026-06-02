@@ -8,6 +8,11 @@ ListenList — ASR 전사 결과를 JSONL 파일로 관리하는 버퍼.
     - append()로 항목 추가, SUMMARY_INTERVAL개마다 백그라운드에서 요약 갱신.
     - 요약 소스는 실제 전사 텍스트 (LLM 생성 내용 아님) → 할루시네이션 없음.
     - 요약 결과는 ready_summary.json에 덮어씀 (정리요청 시 즉시 읽힘).
+
+파일 경로는 broadcast_id로 세션 격리된다 (동시 방송 중첩 방지):
+    sessions/<broadcast_id>/transcriptions.jsonl  ← 전사 누적
+    sessions/<broadcast_id>/ready_summary.json    ← 요약 결과
+broadcast_id가 없으면 "default" 세션을 사용한다. (paths.py 참조)
 """
 
 import json
