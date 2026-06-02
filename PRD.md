@@ -309,21 +309,21 @@ python main.py [--mode {mic|server|client}]
 
 | 항목 | 내용 |
 |---|---|
-| 스크립트 | [scripts/train_sft.py](scripts/train_sft.py) |
+| 노트북 | [llm_training/notebooks/kaggle_train_sft_v3.ipynb](llm_training/notebooks/kaggle_train_sft_v3.ipynb) |
 | 베이스 모델 | Meta-Llama-3.1-8B-Instruct |
 | 방법 | LoRA + QLoRA (4-bit 양자화) |
 | 하드웨어 | RTX 2060 6GB (FP16, batch=1, grad_accum=8) |
-| 학습 데이터 | [data/train_v2.jsonl](data/train_v2.jsonl) (채팅 포맷) |
-| 출력 | `adapters_v2/` (LoRA 가중치) |
+| 학습 데이터 | [llm_training/datasets/train_v3.jsonl](llm_training/datasets/train_v3.jsonl) (채팅 포맷) |
+| 출력 | `llm_training/adapters_v3/` (LoRA 가중치) |
 
 ### 7.3 어댑터 병합
 
 | 항목 | 내용 |
 |---|---|
-| 스크립트 | [scripts/merge_adapter.py](scripts/merge_adapter.py) |
+| 노트북 | [llm_training/notebooks/colab_merge_to_gguf.ipynb](llm_training/notebooks/colab_merge_to_gguf.ipynb) |
 | 과정 | base model + LoRA adapter → merge_and_unload() |
 | 메모리 요구 | ~15-20GB RAM (CPU FP16) |
-| 출력 | `merged_model/` (독립 실행 가능) |
+| 출력 | `llm_training/merged_model_v3/` (독립 실행 가능) |
 
 ### 7.4 Ollama 모델 배포
 
@@ -342,7 +342,7 @@ python main.py [--mode {mic|server|client}]
 
 ```bash
 # ./data/*.txt 파일을 ChromaDB에 적재
-python -m pipeline.llm.utils.ingest_data
+python -m pipeline.llm.chain.ingest_data
 ```
 
 ### 8.2 파이프라인
@@ -367,9 +367,17 @@ c:\0.MyLab\LCAE-AI\
 ├── .env                                 # 공통 설정 (git 포함)
 ├── .env.local.example                   # 민감 설정 템플릿 (API 키 등)
 │
-├── data/
-│   ├── train_v2.jsonl                  # LLM 학습 데이터 (채팅 포맷)
-│   └── train.jsonl
+├── data/                               # RAG 문서 입력(.txt)
+│
+├── llm_training/                       # LLM 학습 전용
+│   ├── datasets/
+│   │   ├── train_v3.jsonl              # 현재 LLM 플로우 기준 학습 데이터
+│   │   ├── train_v2.jsonl              # 이전 학습 데이터
+│   │   └── train.jsonl                 # 초기 학습 데이터
+│   ├── notebooks/
+│   │   ├── kaggle_train_sft_v3.ipynb
+│   │   ├── colab_train_sft.ipynb
+│   │   └── colab_merge_to_gguf.ipynb
 │
 ├── pipeline/
 │   ├── stt/

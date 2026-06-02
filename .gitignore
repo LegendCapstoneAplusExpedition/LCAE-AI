@@ -76,6 +76,7 @@ data/chroma_db/
 
 # LLM 학습
 merged_model/
+merged_model_*/
 adapters/
 adapters_v2/
 adapters_*/
