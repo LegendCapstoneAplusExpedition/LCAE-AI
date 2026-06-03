@@ -30,6 +30,7 @@ LLM 학습 전용 폴더입니다. 런타임 RAG 입력은 루트의 `data/`를 
 ## Run Locally
 
 CUDA용 PyTorch를 먼저 설치한 뒤 학습 의존성을 설치합니다.
+`gguf.py`가 llama.cpp를 clone/build하므로 시스템에 `git`도 필요합니다.
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu124 torch torchaudio

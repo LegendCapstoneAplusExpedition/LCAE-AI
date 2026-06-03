@@ -13,3 +13,7 @@ bitsandbytes>=0.43.0
 datasets>=2.20.0
 safetensors>=0.4.3
 huggingface_hub>=0.24.0
+
+# GGUF conversion / llama.cpp quantization helper
+cmake>=3.28.0
+ninja>=1.11.1

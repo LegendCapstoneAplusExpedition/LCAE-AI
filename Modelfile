@@ -1,4 +1,4 @@
-FROM ./driving-mentor-q4km.gguf
+FROM ./driving-mentor-v3-q4_k_m.gguf.gguf
 
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
