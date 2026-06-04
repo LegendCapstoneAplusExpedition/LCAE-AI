@@ -31,7 +31,7 @@ jiwer>=4.0.0
 torchcodec>=0.11.1
 accelerate
 transformers
-
+dotenv
 # ── LLM / LangGraph / RAG ─────────────────────────────────────────────────────
 langchain>=1.2.15
 langchain-openai>=1.1.12

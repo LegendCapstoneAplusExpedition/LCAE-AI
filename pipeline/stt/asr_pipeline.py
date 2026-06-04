@@ -21,6 +21,15 @@ from typing import Callable, Optional, TypedDict
 import numpy as np
 import websockets
 from dotenv import load_dotenv
+
+# ── 네이티브 라이브러리 교착 예방 (faster_whisper/torch import 보다 먼저) ──────────
+# Windows에서 ctranslate2(OpenMP)와 torch(MKL/OpenMP)가 같은 프로세스에 로드되면
+# libiomp5md.dll이 중복 초기화되어, 워커 스레드에서 모델을 호출할 때 간헐적으로
+# 교착/크래시가 발생한다("잘 되다가 어느 순간 전사가 멈춤"의 유력 원인).
+# 이 플래그는 중복 OpenMP 런타임을 허용해 그 교착을 회피한다.
+# 네이티브 라이브러리 로딩 전에 설정해야 효과가 있으므로 import보다 위에 둔다.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from faster_whisper import WhisperModel
 
 load_dotenv()
@@ -62,6 +71,15 @@ class PipelineConfig:
     compute_type: str = _env("ASR_COMPUTE_TYPE", "auto")
     language: str = _env("ASR_LANGUAGE", "ko")
     beam_size: int = int(_env("ASR_BEAM_SIZE", "5"))
+    # ctranslate2 내부 스레드 수. 0(auto)은 환경에 따라 과다 생성되어 OpenMP 경합을
+    # 키울 수 있어 명시 고정한다. num_workers는 항상 1(단일 스레드 호출 보장).
+    cpu_threads: int = int(_env("ASR_CPU_THREADS", "4"))
+
+    # 안정성(전사 워커 적체/교착 방지)
+    # 전사 대기열 최대 적재 건수. 초과 시 가장 오래된 발화를 버려 실시간성을 지킨다.
+    max_pending_audio: int = int(_env("ASR_MAX_PENDING_AUDIO", "8"))
+    # 단일 전사가 이 시간(초)을 넘기면 워커 교착으로 보고 경고를 남긴다(워치독).
+    transcribe_timeout_s: float = float(_env("ASR_TRANSCRIBE_TIMEOUT_S", "60"))
 
     @property
     def chunk_samples(self) -> int:
@@ -140,11 +158,16 @@ class WhisperTranscriber:
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
 
-        print(f"[Whisper] 모델 로딩: {config.model} | device={device} | compute={compute_type}")
+        print(
+            f"[Whisper] 모델 로딩: {config.model} | device={device} | "
+            f"compute={compute_type} | cpu_threads={config.cpu_threads}"
+        )
         self.model = WhisperModel(
             config.model,
             device=device,
             compute_type=compute_type,
+            cpu_threads=config.cpu_threads,
+            num_workers=1,  # 동시 호출 금지(모델 thread-safety 보장)
         )
         self.config = config
         print("[Whisper] 모델 로딩 완료")
@@ -274,6 +297,11 @@ class ASRCore:
         self._audio_queue: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
         self._result_queue: "queue.Queue[Optional[TranscriptionResult]]" = queue.Queue()
         self._closed = False
+        self._dropped_count = 0
+
+        # 워치독: 전사 워커가 응답 없이 멈추면(교착) 조용한 정지 대신 경고를 남긴다.
+        # _inflight_since는 현재 진행 중인 transcribe()의 시작 시각(monotonic), 없으면 None.
+        self._inflight_since: Optional[float] = None
 
         self._transcribe_worker = threading.Thread(
             target=self._transcribe_loop, daemon=True, name="asr-transcribe"
@@ -281,8 +309,12 @@ class ASRCore:
         self._downstream_worker = threading.Thread(
             target=self._downstream_loop, daemon=True, name="asr-downstream"
         )
+        self._watchdog_worker = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="asr-watchdog"
+        )
         self._transcribe_worker.start()
         self._downstream_worker.start()
+        self._watchdog_worker.start()
         # 바지인 인터럽트 페이싱: 단발성 노이즈에 끊기지 않도록
         # 누적 발화 길이(BARGE_IN_MIN_SPEECH_MS) 이상일 때만 발화 구간당 1회 트리거.
         # VAD가 발화 중에도 깜빡일 수 있으므로 짧은 공백은 무시하고,
@@ -322,10 +354,21 @@ class ASRCore:
 
         audio = self.buffer.push(chunk, is_speech)
         if audio is not None:
+            # 백로그가 한계를 넘으면 가장 오래된 발화부터 버린다. 전사 워커가 입력
+            # 속도를 못 따라가거나 일시 정체될 때 메모리가 무한정 늘지 않게 하고,
+            # 오래된(이미 흘러간) 발화보다 최신 발화를 우선 처리해 실시간성을 지킨다.
+            while self._audio_queue.qsize() >= self.config.max_pending_audio:
+                try:
+                    self._audio_queue.get_nowait()
+                    self._audio_queue.task_done()
+                    self._dropped_count += 1
+                except queue.Empty:
+                    break
             backlog = self._audio_queue.qsize()
+            note = f", 폐기 누적 {self._dropped_count}건" if self._dropped_count else ""
             print(
                 f"[VAD] 발화 종료 → 전사 대기열 적재 "
-                f"({len(audio) / self.config.sample_rate:.2f}s, 대기 {backlog}건)",
+                f"({len(audio) / self.config.sample_rate:.2f}s, 대기 {backlog}건{note})",
                 flush=True,
             )
             self._audio_queue.put(audio)
@@ -337,13 +380,41 @@ class ASRCore:
             try:
                 if audio is None:  # 종료 신호
                     break
+                self._inflight_since = time.monotonic()  # 워치독 감시 시작
                 result = self.transcriber.transcribe(audio)
                 if result["text"].strip():
                     self._result_queue.put(result)
             except Exception as e:
                 print(f"[ASR] 전사 오류: {e}", flush=True)
             finally:
+                self._inflight_since = None  # 워치독 감시 해제
                 self._audio_queue.task_done()
+
+    def _watchdog_loop(self):
+        """전사 워커 감시 — transcribe()가 비정상적으로 오래 멈추면 경고를 남긴다.
+
+        Whisper 모델은 thread-safe하지 않아 다른 스레드에서 강제로 끊거나 재호출할 수
+        없다(동시 호출 시 교착). 또한 이 프로세스가 죽으면 Node가 에이전트를 재시작 없이
+        정리하므로 자동 종료도 부적절하다. 따라서 워치독은 '조용한 정지'를 '명확한 경고'로
+        바꾸는 역할만 한다 — 로그(stdout)는 Node가 수집하므로 즉시 원인 파악이 가능하다.
+        """
+        timeout = self.config.transcribe_timeout_s
+        warned = False
+        while not self._closed:
+            time.sleep(2.0)
+            since = self._inflight_since
+            if since is None:
+                warned = False
+                continue
+            elapsed = time.monotonic() - since
+            if elapsed >= timeout and not warned:
+                warned = True
+                print(
+                    f"[ASR][WATCHDOG] 전사가 {elapsed:.0f}s째 응답 없음 — 워커 교착 의심. "
+                    f"대기열 {self._audio_queue.qsize()}건 적체 중. "
+                    f"지속되면 AI 에이전트 재시작이 필요합니다.",
+                    flush=True,
+                )
 
     def _downstream_loop(self):
         """후처리 전용 워커 — LLM 그래프/TTS(느린 작업)를 단일 스레드에서 순차 실행한다."""

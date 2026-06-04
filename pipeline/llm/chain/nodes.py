@@ -1,6 +1,6 @@
 from langchain_core.messages import AIMessage
 from langchain_chroma import Chroma
-from pipeline.llm.utils.llm import llm_structured
+from pipeline.llm.utils.llm import llm_structured, llm_lock
 from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
@@ -206,12 +206,14 @@ def analyze_write_node(state: AgentState):
     t0 = time.time()
     print(f"[AnalyzeWrite] LLM 호출 시작")
 
-    result: AnalyzeAndWriteResult = llm_structured.with_structured_output(
-        AnalyzeAndWriteResult,
-        method="json_mode",
-    ).invoke([
-        ("human", prompt),
-    ])
+    # 백그라운드 요약(_summarize_to_ready)과 같은 Ollama 모델을 동시에 치지 않도록 직렬화
+    with llm_lock:
+        result: AnalyzeAndWriteResult = llm_structured.with_structured_output(
+            AnalyzeAndWriteResult,
+            method="json_mode",
+        ).invoke([
+            ("human", prompt),
+        ])
 
     elapsed = time.time() - t0
 

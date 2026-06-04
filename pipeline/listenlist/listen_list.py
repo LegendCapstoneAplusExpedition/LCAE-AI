@@ -74,8 +74,8 @@ class ListenList:
     def _summarize_to_ready(self, entries: list[dict]) -> dict | None:
         """이전 요약 + 새 전사 tail 기반으로 LLM 요약 → ready_summary.json 저장."""
         try:
-            from langchain_core.messages import HumanMessage
-            from pipeline.llm.utils.llm import llm_summary
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from pipeline.llm.utils.llm import llm_summary, llm_lock
 
             previous = self._read_ready_summary()
             previous_summary = str(previous.get("summary", "")).strip()
@@ -125,7 +125,23 @@ class ListenList:
                     "- 1~3문장으로, 다른 설명 없이 요약문만 출력하세요."
                 )
 
-            result = llm_summary.invoke([HumanMessage(content=prompt)])
+            # 요약 전용 system 프롬프트. 메인 모델(driving-mentor)을 재사용하는 경우
+            # Modelfile의 멘토 SYSTEM(구조화 JSON 강제)을 이 메시지로 덮어써서
+            # 평문 요약을 받는다. Ollama는 요청에 system 메시지가 있으면 그것을 우선한다.
+            system_prompt = (
+                "당신은 방송 전사 요약기입니다. 입력된 전사 내용만 바탕으로 한국어 평문 "
+                "요약문을 작성하세요. JSON·키-값·대괄호 태그·코드블록·머리말 없이, "
+                "요약 문장 자체만 출력합니다."
+            )
+
+            # 메인 파이프라인(analyze_write)과 같은 Ollama 모델 슬롯을 동시에 치지
+            # 않도록 직렬화한다. 요약은 백그라운드 작업이므로 메인 호출이 진행 중이면
+            # 락을 기다렸다가 그 뒤에 실행된다(동시 호출로 인한 정지 방지).
+            with llm_lock:
+                result = llm_summary.invoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=prompt),
+                ])
             summary = result.content.strip()
 
             ready_summary = {
