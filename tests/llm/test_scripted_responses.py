@@ -21,9 +21,9 @@ class ScriptedResponsesTest(unittest.TestCase):
     def test_example_bridges_are_stable(self):
         expected = [
             "첫 제품 만들기, 많은 분들이 궁금해하는 주제네요.",
-            "핵심 기능 하나에 초점을 맞춰보겠습니다.",
+            "핵심 기능 하나에 집중하자는 얘기네요.",
             "결국 속도도 UX의 일부라는 말이네요.",
-            "피드백을 다음 개선으로 잇는 흐름입니다.",
+            "피드백을 다음 개선으로 잇는 흐름이네요.",
         ]
 
         self.assertEqual(

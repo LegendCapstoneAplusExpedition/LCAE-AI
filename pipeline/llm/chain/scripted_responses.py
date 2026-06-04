@@ -4,14 +4,29 @@ from collections.abc import Iterable
 
 
 MVP_SUMMARY = (
-    "오늘은 첫 제품 만들기를 이야기했습니다. MVP로 핵심 기능 하나에 집중하고, "
-    "반응 속도까지 UX로 챙기며, 사용자 피드백을 작은 단위 개선으로 잇는 것이 핵심이었습니다."
+    "오늘은 첫 제품 만들기를 이야기 나눠봤네요. MVP로 핵심 기능 하나에 집중하고, "
+    "반응 속도까지 UX로 챙기며, 사용자 피드백을 작은 단위 개선으로 잇는 게 핵심이었네요."
 )
 
 MVP_CLOSING = (
     "네, 오늘도 함께해 주셔서 감사합니다. MVP, 속도, 피드백까지 첫 제품을 단단하게 만드는 "
-    "핵심을 짚어봤습니다. 다음 멘토링에서 또 뵙겠습니다."
+    "핵심을 짚어봤어요. 다음 멘토링에서 또 뵙겠습니다."
 )
+
+def opening_script(topics: Iterable[str]) -> str:
+    """AI 진행자가 방송 합류 직후 1회 발화하는 오프닝 멘트.
+
+    멘토가 사전에 입력한 방송 주제(broadcast_topics)를 바탕으로 인사를 건넨다.
+    주제가 없으면 일반 인사로 대체한다.
+    """
+    items = [str(topic).strip() for topic in topics if str(topic).strip()]
+    if not items:
+        return "네, 안녕하세요. 오늘도 멘토링 방송 함께 시작해볼게요."
+    topic_phrase = ", ".join(items[:3])
+    return (
+        f"네, 안녕하세요. 오늘은 '{topic_phrase}' 이야기로 "
+        "멘토링을 함께 나눠볼 텐데요. 편하게 시작해볼게요."
+    )
 
 
 def _contains_all(text: str, keywords: tuple[str, ...]) -> bool:
@@ -28,7 +43,7 @@ def curated_bridge(mentor_text: str) -> str:
         ),
         (
             (("MVP", "핵심"), ("MVP", "검증")),
-            "핵심 기능 하나에 초점을 맞춰보겠습니다.",
+            "핵심 기능 하나에 집중하자는 얘기네요.",
         ),
         (
             (("반응", "늦"), ("속도", "UX")),
@@ -36,7 +51,7 @@ def curated_bridge(mentor_text: str) -> str:
         ),
         (
             (("피드백", "개선"),),
-            "피드백을 다음 개선으로 잇는 흐름입니다.",
+            "피드백을 다음 개선으로 잇는 흐름이네요.",
         ),
         (
             (("커뮤니케이션", "공유"), ("역할", "커뮤니케이션")),

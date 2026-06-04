@@ -8,6 +8,7 @@ from pipeline.llm.chain.scripted_responses import (
     curated_bridge,
     curated_closing,
     curated_summary,
+    opening_script,
 )
 from pipeline.listenlist.paths import ready_summary_path, ready_question_path
 import re
@@ -108,6 +109,9 @@ def _read_ready_summary(state: AgentState) -> str:
 # ──────────────────────────────────────────────
 def fast_intent_check(state: AgentState) -> str:
     cleaned = state.get("cleaned_text", "").strip()
+    if state.get("streaming_stage") == "Opening":
+        print("[FastCheck] Opening stage -> opening (오프닝 멘트 1회)")
+        return "opening"
     if state.get("streaming_stage") == "Outro":
         print("[FastCheck] Outro stage -> wait")
         return "wait"
@@ -219,12 +223,13 @@ def analyze_write_node(state: AgentState):
 - 새 정보나 자연스러운 전환점이 없으면 intent는 "대기", mc_script는 "".
 - 브릿지를 할 때만, 진행자 발화의 구체 키워드 1개를 짚고 다음 흐름을 열어주는 한 문장으로 작성.
 - mc_script는 35자 이내의 짧은 한국어 한 문장.
+- 종결어미는 "~네요", "~하네요", "~이네요" 같은 부드러운 구어체로. "~합니다", "~하겠습니다", "~입니다"체는 피하기.
 
 좋은 브릿지 예시:
 - 반응이 늦으면 경험이 끊긴다 → "결국 속도도 UX의 일부라는 말이네요."
-- MVP는 핵심 기능 하나를 검증한다 → "핵심 기능 하나에 초점을 맞춰보겠습니다."
+- MVP는 핵심 기능 하나를 검증한다 → "핵심 기능 하나에 집중하자는 얘기네요."
 - 역할 분담보다 커뮤니케이션이 중요하다 → "공유 방식이 성패를 가르는 지점이네요."
-- 피드백을 받으며 작은 단위로 개선한다 → "피드백을 다음 개선으로 잇는 흐름입니다."
+- 피드백을 받으며 작은 단위로 개선한다 → "피드백을 다음 개선으로 잇는 흐름이네요."
 
 나쁜 브릿지 예시:
 - "현재 주제를 계속 진행하겠습니다."
@@ -305,6 +310,25 @@ def analyze_write_node(state: AgentState):
         "mc_script":       mc_script,
     }
 
+# ──────────────────────────────────────────────
+# generate_opening_node  (방송 합류 직후 1회, 주제 기반 오프닝 멘트)
+# streaming_stage="Opening"일 때만 발화하고 즉시 "Main"으로 전이한다.
+# ──────────────────────────────────────────────
+def generate_opening_node(state: AgentState):
+    # Opening 단계가 아니면(이미 오프닝을 마쳤으면) 발화하지 않는다 → 1회 보장.
+    if state.get("streaming_stage", "Main") != "Opening":
+        print("[Opening] 이미 오프닝 완료 → 발화 생략")
+        return {"intent": "대기", "mc_script": ""}
+
+    topics = state.get("broadcast_topics", [])
+    mc_script = opening_script(topics)
+    print(f"[Opening] 오프닝 멘트 생성: \"{mc_script}\"")
+    return {
+        "intent":          "설명",
+        "streaming_stage": "Main",  # 오프닝 후 본방송 단계로 전이
+        "current_topic":   state.get("current_topic", "") or (topics[0] if topics else ""),
+        "mc_script":       mc_script,
+    }
 
 def generate_curated_bridge_node(state: AgentState):
     mc_script = curated_bridge(state.get("cleaned_text", ""))
@@ -363,7 +387,7 @@ def summarize_listenlist_node(state: AgentState):
 
     if not _is_usable_summary(summary):
         print("[Summarize] 요약 없음")
-        summary = "아직 요약할 방송 내용이 없습니다."
+        summary = "아직 요약할 만한 방송 내용이 없네요."
 
     print(f"[Summarize] pre-computed 요약 반환: {summary[:60]}...")
     return {
@@ -391,7 +415,7 @@ def generate_question_node(state: AgentState):
         return {
             "intent":           "질문요청",
             "streaming_stage":  "QnA",
-            "mc_script":        "현재 대기 중인 질문이 없습니다.",
+            "mc_script":        "아직 들어온 질문이 없네요.",
             "pending_question": "",
         }
 
@@ -415,7 +439,7 @@ def generate_closing_node(state: AgentState):
         recap = _read_ready_summary(state)
         if not recap:
             topic = state.get("current_topic", "").strip()
-            recap = f"{topic}의 핵심을 함께 짚어봤습니다." if topic else ""
+            recap = f"{topic}의 핵심을 함께 짚어봤네요." if topic else ""
         recap_line = f"{recap} " if recap else ""
         mc_script = (
             f"네, 오늘도 함께해 주셔서 감사합니다. {recap_line}"

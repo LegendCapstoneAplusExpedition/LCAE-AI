@@ -24,6 +24,9 @@ pydub>=0.25.1            # MP3 → PCM 변환 (ffmpeg 필요)
 torch==2.6.0+cu124
 torchaudio==2.6.0+cu124
 
+# Silero-VAD: torch.hub(master) 대신 pip 패키지로 고정 (오프라인·재현 가능 로드)
+silero-vad>=5.1.2
+
 # ── ASR Finetuning ────────────────────────────────────────────────────────────
 datasets
 evaluate

@@ -10,6 +10,7 @@ from pipeline.llm.chain.nodes import (
     generate_question_node,
     generate_curated_bridge_node,
     generate_closing_node,
+    generate_opening_node,
     output_node,
 )
 
@@ -23,6 +24,7 @@ workflow.add_node("summarize_listenlist", summarize_listenlist_node)
 workflow.add_node("generate_question",    generate_question_node)
 workflow.add_node("curated_bridge",       generate_curated_bridge_node)
 workflow.add_node("generate_closing",     generate_closing_node)
+workflow.add_node("generate_opening",     generate_opening_node)
 workflow.add_node("output",               output_node)
 
 # ── 고정 엣지 ────────────────────────────────────────────────────────────────
@@ -33,6 +35,7 @@ workflow.add_conditional_edges(
     "preprocess",
     fast_intent_check,
     {
+        "opening":   "generate_opening",
         "summarize": "summarize_listenlist",
         "question":  "generate_question",
         "bridge":    "curated_bridge",
@@ -61,6 +64,7 @@ workflow.add_conditional_edges(
 workflow.add_edge("summarize_listenlist", "output")
 workflow.add_edge("generate_question",   "output")
 workflow.add_edge("curated_bridge",      "output")
+workflow.add_edge("generate_opening",    "output")
 workflow.add_edge("generate_closing",    "output")
 
 workflow.add_edge("output", END)

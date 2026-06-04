@@ -17,7 +17,7 @@ class AgentState(TypedDict):
     broadcast_topics: list[str]      # 멘토가 사전에 입력한 주제 키워드 목록
 
     # 방송 상태
-    streaming_stage: str            # Main, QnA, Outro (Intro는 외부 화면 처리)
+    streaming_stage: str            # Opening, Main, QnA, Outro (Opening: 합류 직후 오프닝 멘트 1회)
     silence_duration: float         # STT가 전달한 직전 침묵 길이
 
     # 분석 결과

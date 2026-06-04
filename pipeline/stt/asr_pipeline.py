@@ -60,7 +60,8 @@ class PipelineConfig:
     chunk_duration_ms: int = int(_env("AUDIO_CHUNK_DURATION_MS", "30"))
 
     # VAD
-    vad_threshold: float = float(_env("VAD_THRESHOLD", "0.02"))
+    # Silero-VAD는 0~1 확률을 반환하므로 임계값 기본값은 0.5 (에너지 VAD의 0.02가 아님)
+    vad_threshold: float = float(_env("VAD_THRESHOLD", "0.5"))
     silence_duration_s: float = float(_env("VAD_SILENCE_DURATION_S", "0.8"))
     min_speech_duration_s: float = float(_env("VAD_MIN_SPEECH_DURATION_S", "0.3"))
     max_buffer_duration_s: float = float(_env("VAD_MAX_BUFFER_DURATION_S", "30.0"))
@@ -114,13 +115,10 @@ class SileroVAD:
 
     def __init__(self, sample_rate: int = 16000, threshold: float = 0.5):
         import torch
-        self.model, self.utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            trust_repo=True,
-        )
-        self.get_speech_timestamps = self.utils[0]
+        # torch.hub.load(master 브랜치)는 네트워크/버전 변동에 취약해 로딩이 멈추거나
+        # 깨질 수 있어, pip 패키지(silero-vad)로 고정해서 오프라인·재현 가능하게 로드한다.
+        from silero_vad import load_silero_vad
+        self.model = load_silero_vad()  # onnx=False(기본), 네트워크 불필요
         self.sample_rate = sample_rate
         self.threshold = threshold
         self.torch = torch
@@ -540,9 +538,15 @@ class RealtimeASRServer:
         loop = asyncio.get_event_loop()
 
         # 연결별 콜백 구성
+        session_stop_tts = None
+        session_reset = None
         if self.session_factory is not None:
             # 이 연결만을 위한 독립 파이프라인 (state/listen_list/TTS 격리)
             session_on_transcription = self.session_factory(websocket)
+            # 세션이 노출한 TTS 취소 훅(바지인 시 진행/대기 합성 폐기)
+            session_stop_tts = getattr(session_on_transcription, "stop_tts", None)
+            # 세션 상태 초기화 + 오프닝 발화 훅(재소환 시 백엔드의 reset 신호로 호출)
+            session_reset = getattr(session_on_transcription, "reset_session", None)
 
             def callback_with_ws(result: TranscriptionResult):
                 session_on_transcription(result)
@@ -554,8 +558,15 @@ class RealtimeASRServer:
                 else:
                     self.on_transcription(result, websocket)
 
-        # 바지인: 멘토 음성이 감지되면 백엔드에 인터럽트 신호를 보내 TTS를 끊게 함
+        # 바지인: 멘토 음성이 감지되면
+        #   (1) 이 프로세스의 TTSCore 합성 큐를 취소하고(다음 문장이 안 나가게)
+        #   (2) 백엔드에 interrupt 신호를 보내 ffmpeg 버퍼를 비우게 한다.
         def notify_speech_start():
+            if session_stop_tts is not None:
+                try:
+                    session_stop_tts()
+                except Exception:
+                    pass
             try:
                 asyncio.run_coroutine_threadsafe(
                     websocket.send(json.dumps({"type": "interrupt"})), loop
@@ -578,8 +589,16 @@ class RealtimeASRServer:
                     raw = message
                 else:
                     data = json.loads(message)
-                    if data.get("type") == "end":
+                    mtype = data.get("type")
+                    if mtype == "end":
                         break
+                    # 재소환: 백엔드가 브리지를 새로 연결하면 세션 상태를 초기화하고
+                    # 오프닝 멘트를 다시 발화한다. (오디오 프레임이 아니므로 여기서 종료)
+                    if mtype == "reset":
+                        if session_reset is not None:
+                            print("[Server] reset 신호 수신 → 세션 초기화")
+                            await loop.run_in_executor(None, session_reset)
+                        continue
                     import base64
                     raw = base64.b64decode(data["audio"])
 
