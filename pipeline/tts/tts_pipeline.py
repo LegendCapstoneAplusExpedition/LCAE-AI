@@ -354,10 +354,6 @@ class TTSCore:
         )
         engine = _env("TTS_ENGINE", "gtts").lower()
         self._synthesis_lock = threading.Lock()
-        # 바지인 취소용 세대 카운터. stop() 호출마다 증가하며, 진행/대기 중인
-        # 합성은 자신의 세대가 최신과 다르면 결과(on_synthesis)를 폐기한다.
-        self._generation = 0
-        self._gen_lock = threading.Lock()
         self._fallback_synthesizer = None
         self._fallback_engine = None
         if synthesizer:
@@ -374,30 +370,11 @@ class TTSCore:
 
     def synthesize(self, text: str):
         """텍스트 합성 요청. 결과는 on_synthesis 콜백으로 전달됩니다 (별도 스레드)."""
-        with self._gen_lock:
-            gen = self._generation
-        t = threading.Thread(target=self._run, args=(text, gen), daemon=True)
+        t = threading.Thread(target=self._run, args=(text,), daemon=True)
         t.start()
 
-    def stop(self):
-        """바지인 등으로 진행/대기 중인 합성을 모두 취소한다.
-
-        세대 카운터를 올려서, 이미 합성 중이거나 락을 기다리던 작업이
-        완료되더라도 on_synthesis 콜백(=백엔드 전송/재생)으로 넘어가지 않게 한다.
-        멘토 발화 종료 후 다음 발화부터 정상 합성이 재개된다(별도 복구 불필요)."""
-        with self._gen_lock:
-            self._generation += 1
-        print("[TTS] stop() → 진행/대기 중 합성 취소")
-
-    def _run(self, text: str, gen: int):
-        # 락을 얻기 전에 이미 취소됐으면 합성 자체를 생략
-        with self._gen_lock:
-            if gen != self._generation:
-                return
+    def _run(self, text: str):
         with self._synthesis_lock:
-            with self._gen_lock:
-                if gen != self._generation:
-                    return
             try:
                 result = self._synthesizer.synthesize(text)
             except Exception as e:
@@ -407,11 +384,6 @@ class TTSCore:
                 if not self._fallback_synthesizer:
                     self._fallback_synthesizer = WindowsSAPISynthesizer(self.config)
                 result = self._fallback_synthesizer.synthesize(text)
-                # 합성 도중 stop()이 호출됐으면 결과를 폐기 (바지인)
-        with self._gen_lock:
-            if gen != self._generation:
-                print("[TTS] 합성 결과 폐기 (바지인 취소)")
-                return
         self.on_synthesis(result)
 
 

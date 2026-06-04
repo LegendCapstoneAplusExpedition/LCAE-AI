@@ -9,7 +9,7 @@ def mentor_setup(topics: list[str], broadcast_id: str = "") -> AgentState:
         "broadcast_id":     broadcast_id,
         "current_topic":    topics[0] if topics else "",
         "retrieved_info":   [],
-        "streaming_stage":  "Main",
+        "streaming_stage":  "Opening",  # 합류 직후 오프닝 멘트 1회 → 이후 Main
         "silence_duration": 0.0,
         "intent":             "",
         "context_summary":    "",

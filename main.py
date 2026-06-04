@@ -134,27 +134,7 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
             )
             tts.synthesize(last_msg.content)
 
-    def reset_session() -> None:
-        """AI (재)소환 시 세션 상태를 Opening으로 초기화하고 오프닝 멘트를 1회 발화한다.
-
-        퇴장 후 다시 불러들이면(또는 AI 브리지가 새로 연결되면) streaming_stage가
-        Main에 머물러 오프닝이 재생되지 않던 문제를 막는다. 소환 시점마다 호출되어
-        매번 깨끗한 상태에서 시작하도록 보장한다.
-        """
-        tts.stop()  # 이전 세션의 잔여/진행 합성 취소
-        state.clear()
-        state.update(mentor_setup(topics or [], broadcast_id=bid))
-        print("[Session] 상태 초기화 → Opening")
-    
-    # 콜백에 제어 훅 부착 (STT 서버가 바지인/재소환 시 호출)
-    on_transcription.stop_tts = tts.stop            # 바지인: 진행/대기 TTS 취소
-    on_transcription.reset_session = reset_session  # 재소환: 상태 초기화 + 오프닝
-
     emit_opening()
-    
-    # 바지인 훅: 멘토 음성이 감지되면 STT 서버가 호출하여 진행/대기 중 TTS를 취소한다.
-    # (Node 백엔드의 ffmpeg 버퍼 비우기와 함께 동작 — 양쪽을 끊어야 즉시 무음이 된다.)
-    on_transcription.stop_tts = tts.stop
 
     return on_transcription
 
@@ -231,7 +211,7 @@ def main() -> None:
 
     if args.mode == "mic":
         on_transcription = build_pipeline(stt_config, tts_config, topics=topics, broadcast_id=broadcast_id)
-        on_transcription.reset_session()  # 시작 시 오프닝 멘트 1회 (mic 모드는 제어 채널 없음)
+        # on_transcription.reset_session()  # 시작 시 오프닝 멘트 1회 (mic 모드는 제어 채널 없음)
         test = MicrophoneASRTest(stt_config, on_transcription=on_transcription)
         test.run(device=args.mic_device)
 
@@ -271,7 +251,7 @@ def main() -> None:
         import asyncio
         from pipeline.stt import RealtimeASRPipeline
         on_transcription = build_pipeline(stt_config, tts_config, topics=topics, broadcast_id=broadcast_id)
-        on_transcription.reset_session()  # 시작 시 오프닝 멘트 1회 (client 모드는 제어 채널 없음)
+        # on_transcription.reset_session()  # 시작 시 오프닝 멘트 1회 (client 모드는 제어 채널 없음)
         client = RealtimeASRPipeline(config=stt_config, on_transcription=on_transcription)
         try:
             asyncio.run(client.run())
