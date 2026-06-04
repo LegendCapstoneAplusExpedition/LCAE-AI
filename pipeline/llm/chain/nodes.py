@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
-_QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있어요|들어왔)|다음\s*질문|궁금한\s*거)')
+_QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있|없|들어|올라|왔)|다음\s*질문|궁금한\s*거|채팅.{0,6}질문)')
 
 import os as _os
 
