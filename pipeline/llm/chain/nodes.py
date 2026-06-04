@@ -4,6 +4,11 @@ from pipeline.llm.utils.llm import llm_structured, llm_lock
 from pipeline.llm.utils.embeddings import embeddings
 from pipeline.llm.utils.text_cleaner import clean_fillers
 from pipeline.llm.chain.state import AgentState, AnalyzeAndWriteResult
+from pipeline.llm.chain.scripted_responses import (
+    curated_bridge,
+    curated_closing,
+    curated_summary,
+)
 from pipeline.listenlist.paths import ready_summary_path, ready_question_path
 import re
 import time
@@ -12,6 +17,7 @@ from difflib import SequenceMatcher
 _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
 _QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있|없|들어|올라|왔)|다음\s*질문|궁금한\s*거|채팅.{0,6}질문)')
+_OUTRO_RE           = re.compile(r'(방송.{0,12}(마치|마무리|여기까지|종료)|오늘.{0,12}여기까지|다음에\s*또\s*(만나|뵙)|함께해\s*주셔서\s*감사)')
 
 import os as _os
 
@@ -63,22 +69,38 @@ def _is_low_quality_bridge(mc_script: str) -> bool:
         return True
     return len(_WORD_CHARS.findall(script)) < 8
 
-def _curated_bridge(mentor_text: str) -> str:
-    text = mentor_text or ""
-    rules = [
-        (("반응", "늦", "경험"), "결국 속도도 UX의 일부라는 말이네요."),
-        (("속도", "UX"), "결국 속도도 UX의 일부라는 말이네요."),
-        (("MVP", "핵심"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
-        (("MVP", "검증"), "핵심 기능 하나에 초점을 맞춰보겠습니다."),
-        (("커뮤니케이션", "공유"), "공유 방식이 성패를 가르는 지점이네요."),
-        (("역할", "커뮤니케이션"), "공유 방식이 성패를 가르는 지점이네요."),
-        (("피드백", "개선"), "피드백을 다음 개선으로 잇는 흐름입니다."),
-        (("사용자", "흐름"), "사용자 흐름을 기준으로 보자는 얘기네요."),
+def _session_transcripts(state: AgentState) -> list[str]:
+    from pipeline.listenlist.listen_list import ListenList
+
+    broadcast_id = state.get("broadcast_id") or None
+    return [
+        str(entry.get("text", "")).strip()
+        for entry in ListenList(broadcast_id=broadcast_id).read_all()
+        if str(entry.get("text", "")).strip()
     ]
-    for keywords, bridge in rules:
-        if all(keyword in text for keyword in keywords):
-            return bridge
-    return ""
+
+
+def _is_usable_summary(summary: str) -> bool:
+    text = (summary or "").strip()
+    if not text:
+        return False
+    invalid_markers = ("[topic]", "[intent]", "[mc_script]", "```", '{"topic"')
+    return not any(marker in text for marker in invalid_markers)
+
+
+def _read_ready_summary(state: AgentState) -> str:
+    import json
+
+    path = ready_summary_path(state.get("broadcast_id") or None)
+    if not path.exists():
+        return ""
+    try:
+        summary = str(
+            json.loads(path.read_text(encoding="utf-8")).get("summary", "") or ""
+        )
+    except (AttributeError, json.JSONDecodeError):
+        return ""
+    return summary.strip() if _is_usable_summary(summary) else ""
 
 
 # ──────────────────────────────────────────────
@@ -86,12 +108,22 @@ def _curated_bridge(mentor_text: str) -> str:
 # ──────────────────────────────────────────────
 def fast_intent_check(state: AgentState) -> str:
     cleaned = state.get("cleaned_text", "").strip()
+    if state.get("streaming_stage") == "Outro":
+        print("[FastCheck] Outro stage -> wait")
+        return "wait"
     if _SUMMARIZE_RE.search(cleaned):
         print(f"[FastCheck] 정리요청 감지 → pre-computed 요약 즉시 반환")
         return "summarize"
     if _QUESTION_REQ_RE.search(cleaned):
         print(f"[FastCheck] 질문요청 감지 → pre-computed 질문 즉시 반환")
         return "question"
+    if _OUTRO_RE.search(cleaned):
+        print("[FastCheck] 마무리 감지 → 클로징 즉시 반환")
+        return "closing"
+    bridge = curated_bridge(cleaned)
+    if bridge:
+        print(f"[FastCheck] 핵심 브릿지 감지 → \"{bridge}\"")
+        return "bridge"
     if len(_WORD_CHARS.findall(cleaned)) < 5:
         print("[FastCheck] short/filler utterance -> skip LLM")
         return "wait"
@@ -226,7 +258,7 @@ def analyze_write_node(state: AgentState):
         print("[AnalyzeWrite] low-quality/generic bridge -> clear")
         mc_script = ""
     if not mc_script and normalized_intent in ("설명", "질문"):
-        curated = _curated_bridge(last_message)
+        curated = curated_bridge(last_message)
         if curated:
             print("[AnalyzeWrite] curated bridge applied")
             mc_script = curated
@@ -274,6 +306,16 @@ def analyze_write_node(state: AgentState):
     }
 
 
+def generate_curated_bridge_node(state: AgentState):
+    mc_script = curated_bridge(state.get("cleaned_text", ""))
+    return {
+        "intent":          "설명" if mc_script else "대기",
+        "streaming_stage": "Main" if mc_script else state.get("streaming_stage", "Main"),
+        "mc_script":       mc_script,
+        "pending_question": "",
+    }
+
+
 # ──────────────────────────────────────────────
 # decision_node  (즉시, 규칙 기반 라우팅 함수)
 # ──────────────────────────────────────────────
@@ -316,23 +358,19 @@ def decision_node(state: AgentState) -> str:
 # summarize_listenlist_node  (ready_summary.json 기반 즉시 반환)
 # ──────────────────────────────────────────────
 def summarize_listenlist_node(state: AgentState):
-    import json as _json
+    transcripts = _session_transcripts(state)
+    summary = curated_summary(transcripts) or _read_ready_summary(state)
 
-    summary = ""
-    ready_s_path = ready_summary_path(state.get("broadcast_id") or None)
-    if ready_s_path.exists():
-        try:
-            data = _json.loads(ready_s_path.read_text(encoding="utf-8"))
-            summary = data.get("summary", "").strip()
-        except Exception:
-            pass
-
-    if not summary:
+    if not _is_usable_summary(summary):
         print("[Summarize] 요약 없음")
-        return {"mc_script": "아직 요약할 방송 내용이 없습니다."}
+        summary = "아직 요약할 방송 내용이 없습니다."
 
     print(f"[Summarize] pre-computed 요약 반환: {summary[:60]}...")
-    return {"mc_script": summary}
+    return {
+        "intent":          "정리요청",
+        "context_summary": summary,
+        "mc_script":       summary,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -351,6 +389,8 @@ def generate_question_node(state: AgentState):
     if not chat_question:
         print(f"[GenerateQuestion] 대기 질문 없음 ({(time.time()-t0)*1000:.1f}ms)")
         return {
+            "intent":           "질문요청",
+            "streaming_stage":  "QnA",
             "mc_script":        "현재 대기 중인 질문이 없습니다.",
             "pending_question": "",
         }
@@ -361,8 +401,30 @@ def generate_question_node(state: AgentState):
 
     print(f"[GenerateQuestion] 질문 가져옴 ({(time.time()-t0)*1000:.1f}ms): {question}")
     return {
-        "mc_script": mc_script,
+        "intent":           "질문요청",
+        "streaming_stage":  "QnA",
+        "mc_script":        mc_script,
         "pending_question": question,
+    }
+
+
+def generate_closing_node(state: AgentState):
+    transcripts = _session_transcripts(state)
+    mc_script = curated_closing(transcripts)
+    if not mc_script:
+        recap = _read_ready_summary(state)
+        if not recap:
+            topic = state.get("current_topic", "").strip()
+            recap = f"{topic}의 핵심을 함께 짚어봤습니다." if topic else ""
+        recap_line = f"{recap} " if recap else ""
+        mc_script = (
+            f"네, 오늘도 함께해 주셔서 감사합니다. {recap_line}"
+            "다음 멘토링에서 또 뵙겠습니다."
+        )
+    return {
+        "intent": "마무리",
+        "streaming_stage": "Outro",
+        "mc_script": mc_script,
     }
 
 

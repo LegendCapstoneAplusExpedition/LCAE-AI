@@ -7,9 +7,9 @@ LLM (LangGraph) pipeline — AI MC 브릿지 멘트 생성
     from pipeline.llm.chain.graph import app
 
 데이터 흐름:
-    AgentState → analyzer_node → knowledge_search_node
-               → decision_node → (speak) script_writer_node → AIMessage
-                               → (wait)  END
+    AgentState → preprocess_node → fast_intent_check
+               → 확정 반응(브릿지/질문/요약/마무리) → AIMessage
+               → 일반 발화 → knowledge_search_node → analyze_write_node
 """
 
 from pipeline.llm.chain.graph import app
