@@ -541,10 +541,12 @@ class RealtimeASRServer:
         if self.session_factory is not None:
             # 이 연결만을 위한 독립 파이프라인 (state/listen_list/TTS 격리)
             session_on_transcription = self.session_factory(websocket)
+            session_reset = getattr(session_on_transcription, "reset_session", None)
             
             def callback_with_ws(result: TranscriptionResult):
                 session_on_transcription(result)
         else:
+            session_reset = None
             # 레거시: 단일 공유 콜백 (result, websocket) 시그니처
             def callback_with_ws(result: TranscriptionResult):
                 if asyncio.iscoroutinefunction(self.on_transcription):
@@ -576,17 +578,16 @@ class RealtimeASRServer:
                     raw = message
                 else:
                     data = json.loads(message)
-                    if data.get("type") == "end":
-                    # mtype = data.get("type")
-                    # if mtype == "end":
+                    mtype = data.get("type")
+                    if mtype == "end":
                         break
-                    # # 재소환: 백엔드가 브리지를 새로 연결하면 세션 상태를 초기화하고
-                    # # 오프닝 멘트를 다시 발화한다. (오디오 프레임이 아니므로 여기서 종료)
-                    # if mtype == "reset":
-                    #     if session_reset is not None:
-                    #         print("[Server] reset 신호 수신 → 세션 초기화")
-                    #         await loop.run_in_executor(None, session_reset)
-                    #     continue
+                    # 재소환: 백엔드가 브리지를 새로 연결하면 세션 상태를 초기화하고
+                    # 오프닝 멘트를 다시 발화한다. 오디오 프레임이 아니므로 여기서 종료.
+                    if mtype == "reset":
+                        if session_reset is not None:
+                            print("[Server] reset 신호 수신 → 세션 초기화")
+                            await loop.run_in_executor(None, session_reset)
+                        continue
                     import base64
                     raw = base64.b64decode(data["audio"])
 

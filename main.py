@@ -134,8 +134,13 @@ def build_pipeline(stt_config: PipelineConfig, tts_config: TTSConfig, topics: li
             )
             tts.synthesize(last_msg.content)
 
-    emit_opening()
+    def reset_session() -> None:
+        """백엔드가 브리지 준비를 끝낸 뒤 호출하는 세션 시작 신호."""
+        nonlocal state
+        state = mentor_setup(topics or [], broadcast_id=bid)
+        emit_opening()
 
+    on_transcription.reset_session = reset_session
     return on_transcription
 
 
