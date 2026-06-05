@@ -19,6 +19,7 @@ _WORD_CHARS = re.compile(r'[가-힣a-zA-Z0-9]')
 _SUMMARIZE_RE       = re.compile(r'(정리해|요약해|지금까지\s*내용)')
 _QUESTION_REQ_RE    = re.compile(r'(질문\s*(받|정리|해주|넘겨|있|없|들어|올라|왔)|다음\s*질문|궁금한\s*거|채팅.{0,6}질문)')
 _OUTRO_RE           = re.compile(r'(방송.{0,12}(마치|마무리|여기까지|종료)|오늘.{0,12}여기까지|다음에\s*또\s*(만나|뵙)|함께해\s*주셔서\s*감사)')
+_SENTENCE_RE        = re.compile(r'[^.!?\n]+[.!?]?')
 
 import os as _os
 
@@ -102,6 +103,77 @@ def _read_ready_summary(state: AgentState) -> str:
     except (AttributeError, json.JSONDecodeError):
         return ""
     return summary.strip() if _is_usable_summary(summary) else ""
+
+def _clean_sentence(text: str) -> str:
+    cleaned = re.sub(r'\s+', ' ', (text or "")).strip()
+    return cleaned.rstrip(".!?。")
+
+def _first_sentence(text: str) -> str:
+    for match in _SENTENCE_RE.finditer(text or ""):
+        sentence = _clean_sentence(match.group(0))
+        if sentence:
+            return sentence
+    return ""
+
+def _short_topic(text: str) -> str:
+    topic = re.sub(r'\s+', ' ', (text or "")).strip(" .!?。\"'")
+    if not topic:
+        return "방송 내용"
+    for sep in ("|", ",", "·", "/", " - ", "에 대해", "에 대한"):
+        if sep in topic:
+            topic = topic.split(sep, 1)[0].strip()
+    if len(topic) > 18:
+        topic = topic[:18].rstrip()
+    return topic or "방송 내용"
+
+def _topic_for_summary(state: AgentState, summary: str) -> str:
+    current_topic = state.get("current_topic", "")
+    if current_topic:
+        return _short_topic(current_topic)
+    broadcast_topics = state.get("broadcast_topics", [])
+    if broadcast_topics:
+        return _short_topic(broadcast_topics[0])
+    return _short_topic(_first_sentence(summary))
+
+def _summary_request_script(state: AgentState, summary: str) -> str:
+    topic = _topic_for_summary(state, summary)
+    summary_text = _clean_sentence(summary)
+    if not summary_text or summary_text == "아직 요약할 핵심 내용이 없습니다":
+        summary_text = "아직 요약할 방송 내용이 없습니다."
+    return f"오늘은 {topic}에 대해 이야기했습니다. {summary_text}"
+
+def _closing_core(text: str) -> str:
+    core = _clean_sentence(text)
+    if core.endswith("입니다"):
+        return f"{core[:-3]}이라는 점"
+    if core.endswith("합니다"):
+        return f"{core[:-3]}한다는 점"
+    if core.endswith("됩니다"):
+        return f"{core[:-3]}된다는 점"
+    if core.endswith("다"):
+        return f"{core[:-1]}다는 점"
+    if core.endswith("점"):
+        return core
+    return f"{core}라는 점"
+
+def _closing_script(state: AgentState) -> str:
+    summary = (state.get("context_summary", "") or "").strip()
+    core = _first_sentence(summary)
+    if not core:
+        ready_s_path = ready_summary_path(state.get("broadcast_id") or None)
+        if ready_s_path.exists():
+            try:
+                import json as _json
+                data = _json.loads(ready_s_path.read_text(encoding="utf-8"))
+                core = _first_sentence(data.get("summary", ""))
+            except Exception:
+                core = ""
+    if not core:
+        topic = _topic_for_summary(state, summary)
+        core = f"{topic}의 핵심 내용"
+    else:
+        core = _closing_core(core)
+    return f"네, 오늘도 함께해주셔서 감사합니다. {core}을 짚어봤습니다. 다음 멘토링에서 또 뵙겠습니다."
 
 
 # ──────────────────────────────────────────────
@@ -224,6 +296,9 @@ def analyze_write_node(state: AgentState):
 - 브릿지를 할 때만, 진행자 발화의 구체 키워드 1개를 짚고 다음 흐름을 열어주는 한 문장으로 작성.
 - mc_script는 35자 이내의 짧은 한국어 한 문장.
 - 종결어미는 "~네요", "~하네요", "~이네요" 같은 부드러운 구어체로. "~합니다", "~하겠습니다", "~입니다"체는 피하기.
+- intent=정리요청이면 반드시 "오늘은 {{주제}}에 대해 이야기했습니다."로 시작하고, 방송 내용을 간결하게 정리.
+- intent=마무리이면 반드시 "네, 오늘도 함께해주셔서 감사합니다. {{핵심 내용}}을 짚어봤습니다. 다음 멘토링에서 또 뵙겠습니다." 형식으로 작성.
+- 마무리의 핵심 내용은 누적 요약에서 가장 중요한 내용 하나만 한 문장으로 선택.
 
 좋은 브릿지 예시:
 - 반응이 늦으면 경험이 끊긴다 → "결국 속도도 UX의 일부라는 말이네요."
@@ -393,7 +468,7 @@ def summarize_listenlist_node(state: AgentState):
     return {
         "intent":          "정리요청",
         "context_summary": summary,
-        "mc_script":       summary,
+        "mc_script":       _summary_request_script(state, summary),
     }
 
 
@@ -457,6 +532,9 @@ def generate_closing_node(state: AgentState):
 # ──────────────────────────────────────────────
 def output_node(state: AgentState):
     mc_script = state.get("mc_script", "").strip()
+
+    if state.get("intent") == "마무리":
+        mc_script = _closing_script(state)
 
     if not mc_script:
         print("[Output] mc_script 없음 → 발화 생략")
