@@ -25,7 +25,7 @@ def opening_script(topics: Iterable[str]) -> str:
     topic_phrase = ", ".join(items[:3])
     return (
         f"네, 안녕하세요. 오늘은 '{topic_phrase}' 이야기로 "
-        "멘토링을 함께 나눠볼 텐데요. 편하게 시작해볼게요."
+        "멘토링을 함께 나눠보도록 할게요. 편하게 시작해주세요."
     )
 
 

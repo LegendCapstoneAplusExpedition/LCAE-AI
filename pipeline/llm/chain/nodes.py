@@ -108,6 +108,19 @@ def _clean_sentence(text: str) -> str:
     cleaned = re.sub(r'\s+', ' ', (text or "")).strip()
     return cleaned.rstrip(".!?。")
 
+def _fix_korean_endings(text: str) -> str:
+    fixed = re.sub(r'가능합(?=\.|,|\s|$)', '가능합니다', text or "")
+    fixed = re.sub(r'필요합(?=\.|,|\s|$)', '필요합니다', fixed)
+    fixed = re.sub(r'중요합(?=\.|,|\s|$)', '중요합니다', fixed)
+    fixed = re.sub(r'도움이요(?=\.|,|\s|$)', '도움이 됩니다', fixed)
+    return fixed
+
+def _with_period(text: str) -> str:
+    cleaned = _fix_korean_endings(re.sub(r'\s+', ' ', (text or "")).strip())
+    if not cleaned:
+        return ""
+    return cleaned if cleaned[-1] in ".!?。…" else f"{cleaned}."
+
 def _first_sentence(text: str) -> str:
     for match in _SENTENCE_RE.finditer(text or ""):
         sentence = _clean_sentence(match.group(0))
@@ -123,8 +136,29 @@ def _short_topic(text: str) -> str:
         if sep in topic:
             topic = topic.split(sep, 1)[0].strip()
     if len(topic) > 18:
-        topic = topic[:18].rstrip()
+        topic = _keyword_topic(topic)
     return topic or "방송 내용"
+
+def _keyword_topic(text: str) -> str:
+    stopwords = {
+        "방법", "때", "경우", "내용", "이야기", "이야기했습니다",
+        "해야", "하려면", "위해", "위해서", "가능합니다", "가능합",
+    }
+    words = []
+    for raw in re.findall(r'[가-힣A-Za-z0-9]+', text or ""):
+        word = raw
+        for suffix in ("에게", "에서", "으로", "로", "에게서", "부터", "까지", "은", "는", "이", "가", "을", "를", "과", "와", "에", "의"):
+            if len(word) > len(suffix) + 1 and word.endswith(suffix):
+                word = word[:-len(suffix)]
+                break
+        if word.endswith("하는") and len(word) > 4:
+            word = word[:-2]
+        if len(word) < 2 or word in stopwords or word.endswith(("해야", "혀야", "려야", "야")):
+            continue
+        words.append(word)
+    if not words:
+        return "방송 내용"
+    return " ".join(words[:3])
 
 def _topic_for_summary(state: AgentState, summary: str) -> str:
     current_topic = state.get("current_topic", "")
@@ -137,15 +171,22 @@ def _topic_for_summary(state: AgentState, summary: str) -> str:
 
 def _summary_request_script(state: AgentState, summary: str) -> str:
     topic = _topic_for_summary(state, summary)
-    summary_text = _clean_sentence(summary)
+    summary_text = _with_period(summary)
     if not summary_text or summary_text == "아직 요약할 핵심 내용이 없습니다":
         summary_text = "아직 요약할 방송 내용이 없습니다."
     return f"오늘은 {topic}에 대해 이야기했습니다. {summary_text}"
 
 def _closing_core(text: str) -> str:
     core = _clean_sentence(text)
+    core = _fix_korean_endings(core)
     if core.endswith("입니다"):
         return f"{core[:-3]}이라는 점"
+    if core.endswith("집니다"):
+        return f"{core[:-3]}진다는 점"
+    if core.endswith("습니다"):
+        return f"{core[:-3]}다는 점"
+    if core.endswith(("가능합니다", "중요합니다", "필요합니다")):
+        return f"{core[:-3]}하다는 점"
     if core.endswith("합니다"):
         return f"{core[:-3]}한다는 점"
     if core.endswith("됩니다"):
